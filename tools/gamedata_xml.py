@@ -11,6 +11,8 @@ For every file it records the root element, element count, maximum depth, attrib
 ``platform:/`` references, and include-like structures. For every root it records the file count, category,
 element-name histogram, attribute histogram and reference targets. ``--check`` validates well-formedness and
 separates rootless fragments, tail-only documents and malformed documents.
+Well-formed documents use the parser's expanded root name (including its XML namespace), just as
+the element histogram does. A raw tag hint is only needed when recovering incomplete documents.
 
 Only schema names, element/attribute names and reference tokens are written. Element text, attribute values,
 ``type``/``content`` values and entry paths are not. For a carve directory a row is identified by offset; an
@@ -18,6 +20,7 @@ individual file is identified by the basename that was passed. The output is a l
 be committed or attached to an issue. Report paths are refused before the scan when they alias an input: a
 nested XML in directory mode, or a carve ``index.json`` or stream. The test fixtures are synthetic and contain
 no game data.
+Usage: `python -I tools/gamedata_xml.py --help` lists the options.
 """
 import argparse
 import csv
@@ -239,6 +242,7 @@ def file_row(doc: dict, scan: dict) -> dict:
         header = gi.has_xml_decl(doc["data"])
     well_formed = scan["well_formed"]
     if well_formed:
+        root = scan["root"]  # the parsed name includes its namespace; a recovery hint need not
         tail_only = fragment = False
     elif doc.get("from_carve"):
         tail_only = not header

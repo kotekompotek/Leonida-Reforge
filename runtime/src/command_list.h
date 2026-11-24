@@ -414,9 +414,11 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
-// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
-// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
-// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
+// D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
+// list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
+// (DispatchMesh) takes its thread-group counts in count (x), instances (y) and first (z), and ignores the vertex
+// and index buffers and the topology.
 // Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
 // during command list recording (D3D-289).
 struct Draw {
@@ -437,6 +439,7 @@ struct Draw {
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
+    bool mesh = false;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -482,7 +485,8 @@ struct WriteImmediate {
     std::uint32_t mode;
 };
 
-// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource.
+// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource
+// (end == UINT64_MAX is the D3D12 sentinel meaning through the end of the subresource).
 struct DependentRange {
     ResourceId resource;
     std::uint32_t subresource;
@@ -738,10 +742,11 @@ public:
         return append(dispatch);
     }
 
-    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    // A draw with no vertices or instances, or a mesh draw with no thread groups, does nothing in D3D12, and is
+    // not recorded.
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
@@ -757,12 +762,13 @@ public:
     }
 
     // ClearDepthStencilView; the cleared planes must be in depth_write state at execution.
-    // D3D12 requires depth in [0, 1] and at least one clear flag.
+    // A D32_FLOAT target keeps the depth exactly as given, outside [0, 1] and NaN included (measured on WARP,
+    // d3d12_clear_test); a D16 target quantizes it at replay. Flags that name no plane close the list and clear nothing.
     bool clear_depth_stencil(const TargetView& target, std::uint32_t flags, float depth, std::uint8_t stencil,
                              std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
-        if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
-        if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
+        if (flags & ~(clear_depth | clear_stencil)) return false;
+        if (!flags) return !closed_;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
@@ -782,16 +788,15 @@ public:
         return append(write);
     }
 
-    // AtomicCopyBufferUINT/UINT64, with the rules of the D3D12 debug layer's ATOMICCOPYBUFFER_* messages (IDs
-    // 1027-1040 in d3d12sdklayers.h): both offsets aligned to the copy's size and at least one dependency, each on a
-    // named resource. A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
+    // AtomicCopyBufferUINT/UINT64: both offsets aligned to the copy's size and each dependency on a named resource with
+    // a non-empty, non-inverted range (zero dependencies is accepted by the Windows 11 WARP and RTX 5090 D3D12
+    // runtimes). A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
     bool atomic_copy(const AtomicCopyBuffer& copy) {
         if ((copy.bytes != 4 && copy.bytes != 8) || !copy.dst || !copy.src) return false;
         if (copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
         if (copy.dst_offset % copy.bytes || copy.src_offset % copy.bytes) return false;
-        if (copy.dependencies.empty()) return false;
         for (const auto& d : copy.dependencies)
-            if (!d.resource) return false;
+            if (!d.resource || d.begin >= d.end) return false;
         return append(copy);
     }
 
@@ -866,22 +871,26 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.argument_buffer || !indirect.stride || indirect.stride % 4) return false;
+        if (indirect.argument_offset % 4) return false;
+        if (!indirect.count_buffer && indirect.count_offset) return false;
+        if (indirect.count_buffer && indirect.count_offset % 4) return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }
 
+    // D3D12: acceleration structures and build scratch are 256-byte aligned; postbuild destinations 8-byte aligned.
     bool build_acceleration_structure(BuildAccelerationStructure build) {
-        if (!build.dst_va || !build.scratch_va) return false;
+        if (!build.dst_va || build.dst_va % 256 || !build.scratch_va || build.scratch_va % 256) return false;
+        if (build.update && (!build.src_va || build.src_va % 256)) return false;
         return append(std::move(build));
     }
-    // D3D12: acceleration structures are 256-byte aligned, postbuild destinations 8-byte aligned.
     bool copy_acceleration_structure(CopyAccelerationStructure copy) {
-        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return false;
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 || copy.mode > 4) return false;
         return append(copy);
     }
     bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
-        if (!info.dest_va || info.dest_va % 8 || info.sources.empty()) return false;
+        if (!info.dest_va || info.dest_va % 8 || info.type > 3 || info.sources.empty()) return false;
         for (const auto va : info.sources)
             if (!va || va % 256) return false;
         return append(std::move(info));

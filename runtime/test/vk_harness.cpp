@@ -7,6 +7,7 @@
 //
 // Push constants follow the contract in docs/design.md: s0..s31, then the heap base lo/hi. They are zero unless
 //   VKH_SGPRS=w0,w1,...          sets s0, s1, ... (decimal or 0x hex)
+//   VKH_GS_PRIMITIVES=1          reports "gs_primitives=N" on stderr for the VKH_GS draw (77 if unsupported)
 //   VKH_HEAP=addr=word,...       allocates a zeroed 64 KiB heap (Xbox VA 0 = its device address), writes each word at
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
 //   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
@@ -35,6 +36,15 @@
 #include "vk_pc_tail.h"
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "spirv_capability.h"
+
+// VK_KHR_pipeline_binary is newer than some Vulkan header sets (CI images, an older SDK). Guard the feature so the
+// harness still builds there; VKH_BINARY_OUT/VKH_BINARY_IN then report unsupported and exit 77.
+#if defined(VK_KHR_pipeline_binary) && defined(VK_KHR_maintenance5)
+#define VKH_PIPELINE_BINARY 1
+#else
+#define VKH_PIPELINE_BINARY 0
+#endif
 
 #include <cctype>
 #include <cstddef>
@@ -451,9 +461,15 @@ int main(int argc, char** argv) {
     // size, the data.
     const char* bin_out = std::getenv("VKH_BINARY_OUT");
     const char* bin_in = std::getenv("VKH_BINARY_IN");
+#if VKH_PIPELINE_BINARY
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+#endif
     if (bin_out || bin_in) {
+#if !VKH_PIPELINE_BINARY
+        std::fprintf(stderr, "unsupported: these Vulkan headers have no VK_KHR_pipeline_binary\n");
+        return 77;
+#else
         VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDevicePipelineBinaryFeaturesKHR pbq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
         q.pNext = &pbq;
@@ -467,6 +483,7 @@ int main(int argc, char** argv) {
         enable.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
         pbf.pipelineBinaries = VK_TRUE; pbf.pNext = chain; chain = &pbf;
         m5.maintenance5 = VK_TRUE; m5.pNext = chain; chain = &m5;
+#endif
     }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -476,11 +493,22 @@ int main(int argc, char** argv) {
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
     // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
     const char* gs_path = std::getenv("VKH_GS");
+    const char* count_opt = std::getenv("VKH_GS_PRIMITIVES");
+    const bool count_gs = count_opt && std::strcmp(count_opt, "1") == 0;
+    if (count_gs && (!gs_path || !*gs_path || mesh || mesh_compute)) {
+        std::fprintf(stderr, "VKH_GS_PRIMITIVES=1 requires a VS/GS/FS draw with VKH_GS\n");
+        return 1;
+    }
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
     }
     VkPhysicalDeviceFeatures feats{};
+    if (count_gs && !f2q.features.pipelineStatisticsQuery) {
+        std::fprintf(stderr, "unsupported: no pipelineStatisticsQuery\n");
+        return 77;
+    }
+    feats.pipelineStatisticsQuery = count_gs;
     if (clip_shifts && !f2q.features.shaderClipDistance) {
         std::fprintf(stderr, "unsupported: shaderClipDistance\n");
         return 77;
@@ -495,9 +523,18 @@ int main(int argc, char** argv) {
         }
         feats.shaderFloat64 = VK_TRUE;
     }
-    if (need_heap || mesh_compute) {
-        if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: 64-bit addresses need shaderInt64\n"); return 77; }
-        feats.shaderInt64 = VK_TRUE;   // heap and --mesh-compute output addresses are 64-bit
+    // shaderInt64 only when a stage has 64-bit integers. Heap and --mesh-compute addresses are 64-bit, but rdna2spirv.py
+    // builds them from 32-bit pairs unless the shader also does 64-bit arithmetic (SHADER-423), so the module decides,
+    // not VKH_HEAP (TEST-468).
+    bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code);
+    for (const char* p : std::initializer_list<const char*>{argv[1], mesh_vs_path, gs_path})
+        if (p && !needs_int64) needs_int64 = leonida::vk_test::needs_shader_int64(read_spv(p));
+    if (needs_int64) {
+        if (!f2q.features.shaderInt64) {
+            std::fprintf(stderr, "unsupported: a stage declares Int64 and the device has no shaderInt64\n");
+            return 77;
+        }
+        feats.shaderInt64 = VK_TRUE;
     }
     if (tex_rgba_path) {
         if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
@@ -727,6 +764,7 @@ int main(int argc, char** argv) {
         gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
+#if VKH_PIPELINE_BINARY
     VkPipelineCreateFlags2CreateInfoKHR capture{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
     std::vector<VkPipelineBinaryKHR> in_bins;
     VkPipelineBinaryInfoKHR bin_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
@@ -765,7 +803,9 @@ int main(int argc, char** argv) {
         gpi.pNext = &bin_info;
         std::fprintf(stderr, "pipeline from %u binaries in %s\n", count, bin_in);
     }
+#endif
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
+#if VKH_PIPELINE_BINARY
     if (bin_out) {
         auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
             vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
@@ -802,6 +842,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
+#endif
     VkPipeline cpipe = VK_NULL_HANDLE;
     if (mesh_compute) {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -1010,6 +1051,17 @@ int main(int argc, char** argv) {
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
+    VkQueryPool gs_query = VK_NULL_HANDLE;
+    if (count_gs) {
+        LOADD(vkCreateQueryPool);
+        LOADD(vkCmdResetQueryPool);
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        info.queryCount = 1;
+        info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT;
+        CHECK(vkCreateQueryPool(dev, &info, nullptr, &gs_query));
+        vkCmdResetQueryPool(cmd, gs_query, 0, 1);
+    }
     VkClearValue clears[2]{};
     for (float& c : clears[0].color.float32) c = -1;   // marks untouched pixels
     if (clip_shifts) {
@@ -1088,6 +1140,10 @@ int main(int argc, char** argv) {
     }
     // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
     const char* vertices_env = std::getenv("VKH_VERTICES");
+    if (count_gs) {
+        LOADD(vkCmdBeginQuery);
+        vkCmdBeginQuery(cmd, gs_query, 0, 0);
+    }
     if (draw_mesh_path) {
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &offset);
@@ -1106,6 +1162,10 @@ int main(int argc, char** argv) {
         if (const char* d = std::getenv("VKH_DRAW")) std::sscanf(d, "%u,%u", &first_vertex, &first_instance);
         vkCmdDraw(cmd, 3, 1, first_vertex, first_instance);
     }
+    if (count_gs) {
+        LOADD(vkCmdEndQuery);
+        vkCmdEndQuery(cmd, gs_query, 0);
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
@@ -1119,6 +1179,15 @@ int main(int argc, char** argv) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
+    if (count_gs) {
+        LOADD(vkGetQueryPoolResults);
+        LOADD(vkDestroyQueryPool);
+        uint64_t primitives = 0;
+        CHECK(vkGetQueryPoolResults(dev, gs_query, 0, 1, sizeof(primitives), &primitives,
+                                    sizeof(primitives), VK_QUERY_RESULT_64_BIT));
+        vkDestroyQueryPool(dev, gs_query, nullptr);
+        std::fprintf(stderr, "gs_primitives=%llu\n", static_cast<unsigned long long>(primitives));
+    }
     void* p; CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
     std::ofstream output(argv[3], std::ios::binary);
     output.write(static_cast<const char*>(p), std::streamsize(bi.size));

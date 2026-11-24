@@ -271,6 +271,20 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertIn("-mcode-object-version=5", args)
         self.assertIn("-mwavefrontsize64", args)
 
+    def test_the_hip_linker_uses_amdgpu_elf_emulation(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            code, error = o._assemble("")
+        self.assertEqual(error, "")
+        run.assert_called_with(
+            [o.lld, "-m", "elf64_amdgpu", "-shared", os.path.join(tmp, "k.o"), "-o", code],
+            capture_output=True, text=True,
+        )
+
     def test_true16_is_used_only_where_the_assembler_needs_it(self):
         bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
         half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
@@ -409,14 +423,18 @@ class VcvarsScript(unittest.TestCase):
 
     def test_ascii_paths_give_the_same_commands_as_before(self):
         with tempfile.TemporaryDirectory() as tmp:
-            work = os.path.join(tmp, "work")
-            os.makedirs(work)
-            argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
-            with open(os.path.join(work, argv[-1]), "rb") as f:
-                # UTF-8, not ASCII: the /Fo folder sits in %TEMP%, which can hold a non-ASCII user name.
-                lines = f.read().decode("utf-8").split("\r\n")
-        self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
-        self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
+            for name in ("work", "a b", "a & b"):
+                with self.subTest(name=name):
+                    work = os.path.join(tmp, name)
+                    os.makedirs(work)
+                    argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
+                    with open(os.path.join(work, argv[-1]), "rb") as f:
+                        # UTF-8, not ASCII: the /Fo folder sits in %TEMP%, which can hold a non-ASCII user name.
+                        lines = f.read().decode("utf-8").split("\r\n")
+                    self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
+                    self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe "))
+                    # list2cmdline quotes /Fo when the work folder holds a space or a cmd metacharacter such as &.
+                    self.assertIn(f"/Fo{work}{os.sep}", lines[4].replace('"', ""))
 
     def test_the_direct_compilers_write_no_script(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -708,6 +726,40 @@ class LinuxBackend(unittest.TestCase):
             with self.assertRaisesRegex(runner.Unavailable, "LEONIDA_HW_DRM_NODE"):
                 runner.open_oracle()
 
+    def test_the_device_line_names_every_engine_generation(self):
+        # hw_oracle_drm.c labels the chip from the kernel's family id and revision; a chip it can only label by
+        # generation still assembles, because every member of a generation takes the same encodings.
+        o = object.__new__(drm.DrmOracle)      # no launcher is built or run
+
+        def arch(stdout="", stderr=""):
+            done = subprocess.CompletedProcess([], 0, stdout, stderr)
+            with unittest.mock.patch.object(drm.subprocess, "run", return_value=done):
+                return o._device_arch()
+
+        o.exe, o.node = "hw_oracle_drm", "/dev/dri/renderD129"
+        self.assertEqual(arch("# device=AMD Radeon RX 9070 (0x7550) arch=gfx1201 engine=12.0\n"), "gfx1201")
+        self.assertEqual(arch("# device=AMD Radeon RX 7900 XTX (0x744c) arch=gfx1100 engine=11.0\n"), "gfx1100")
+        self.assertEqual(arch("# device=AMD GPU (0x0000) arch=gfx11xx engine=11.0\n"), "gfx1100")
+        self.assertEqual(arch("# device=AMD GPU (0x0000) arch=gfx12xx engine=12.0\n"), "gfx1201")
+        self.assertEqual(arch("# device=AMD GPU (0x0000) arch=gfx10xx engine=10.1\n"), "gfx1030")
+        self.assertEqual(arch("# device=AMD GPU (0x0000) engine=10.3\n"), "gfx1030")
+        with self.assertRaisesRegex(runner.Unavailable, "only version"):
+            arch(stderr="compute engine 12.0: only versions 10 (GFX10, RDNA1 and RDNA2), 11 (GFX11, RDNA3) and "
+                        "12 (GFX12, RDNA4) are supported\n")
+
+    def test_the_launcher_builds_with_the_libdrm_headers(self):
+        # The engine-11/12 support lives in C: this compiles hw_oracle_drm.c exactly as drm.py does, wherever gcc
+        # and the libdrm_amdgpu headers are installed, and needs no GPU.
+        o = object.__new__(drm.DrmOracle)
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(drm.tempfile, "gettempdir", return_value=tmp):
+            try:
+                exe = o._build_launcher()
+            except runner.Unavailable as e:
+                raise unittest.SkipTest(f"gcc and the libdrm_amdgpu headers are needed: {e}") from None
+            self.assertTrue(os.path.isfile(exe) and os.access(exe, os.X_OK), exe)
+            self.assertIn("leonida_hw_oracle_drm_", os.path.basename(exe))
+
 
 class OnHardware(unittest.TestCase):
     @classmethod
@@ -777,7 +829,7 @@ class OnHardware(unittest.TestCase):
         # image_fuzz's 64x64 cases (16,384) and this one need.
         lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
         lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
-        lines += ["s_waitcnt vmcnt(0)"]
+        lines += ["s_waitcnt vmcnt(0)", "s_endpgm"]
         kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
         self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
 

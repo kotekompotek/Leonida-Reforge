@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py` and `tools/cf_diff.py`.
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py` and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
 
 ## Why `spirv-val` is not enough
 
@@ -47,6 +47,14 @@ translator → `spirv-as`/`spirv-val` → Vulkan tools path is what the future G
 a reference to be trusted. A hand-written SPIR-V twin of a test program is a useful third control: it
 checks the harness and driver without involving the translator, so a harness failure is not blamed on
 translation.
+
+Assembling needs no external `spirv-as` binary: `tools/spirv_asm.py` encodes SPIR-V assembly text into binary
+words in process, as a module (`assemble(text, target_env="vulkan1.2")`) or from the command line
+(`python -I tools/spirv_asm.py in.spvasm -o out.spv`, with `--target-env` choosing the environment and
+`vulkan1.2` the default), using the Khronos SPIRV-Headers grammar kept in `tools/spirv_asm_tables.py`.
+`tools/rdna2spirv.py --assembler python` takes that path instead of the `spirv-as` subprocess and its
+temporary `.spvasm` file; `spirv-val` stays the external validator. `tests/test_spirv_asm.py` and
+`tests/test_spirv_asm_tables.py` cover the assembler and the tables.
 
 The CPU model is deliberately not a second translator. It interprets the listing's mnemonics and
 operands; it never consumes SPIR-V. That independence is what makes a disagreement meaningful.
@@ -524,12 +532,18 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   no other program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
 - **GFX12** (`hw_oracle/asm.py` `sync_lines`): there is no `s_barrier` (a workgroup barrier is
   `s_barrier_signal -1` then `s_barrier_wait -1`), and the LDS wait is `s_wait_dscnt 0` instead of the legacy
-  `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` reaches all 64 lanes on GFX12**, while RDNA2 (and gfx1150)
-  keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the RX 9070 XT returns lane
-  `l ^ 32` and a gfx1036 iGPU returns lane `l`. The model describes RDNA2, so on gfx12xx a wave64 program with a
-  `ds_bpermute` is skipped with that reason; under `--perturb bpermute_wave64_cross` all 1,000 wave64 programs of
-  seed 1 match there. RX 9070 XT, AMD 26.11.2, `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64
-  537 and 506 match, 0 mismatch, the rest skipped for that reason. The gfx1036 iGPU gives 1,000/1,000 in both.
+  `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` and `ds_permute_b32` reach all 64 lanes on GFX12**, while
+  RDNA2 (and gfx1150) keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the
+  RX 9070 XT returns lane `l ^ 32` and a gfx1036 iGPU returns lane `l`; and with every lane *sending* to lane
+  `(l + 32) mod 64`, the RX 9070 (gfx1201, same as the XT measurement) delivers the sender's value to lane
+  `l ^ 32`, all 64 lanes, with lane-`l`-to-lane-`l` sending as the control. A masked wave64 `ds_swizzle` keeps
+  its halves (0 mismatches in a 40-program `--swizzle-exec` run there). The model describes RDNA2, so on gfx12xx
+  a wave64 program with either op is skipped with that reason; under `--perturb bpermute_wave64_cross` /
+  `--perturb permute_wave64_cross` the programs that run match there (the `--extended` 40 programs of seed 1:
+  23 of 40 wave64 match, 0 mismatch, the rest skipped for the bpermute reason). RX 9070 XT, AMD 26.11.2,
+  `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64 537 and 506 match, 0 mismatch, the rest
+  skipped for that reason; on the RX 9070, `--programs 500`, seed 1: wave32 500/500 match, wave64 250 match and
+  250 skipped, 0 mismatch, 0 rejected. The gfx1036 iGPU gives 1,000/1,000 in both.
 - **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
   (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
   `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a
@@ -722,9 +736,10 @@ Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32
 and `R8G8B8A8_UINT`/`SINT`, all as sampled images, as the runtime binds a read-only texture (integer formats are
 read through the translator's uint/sint aliases of the sampled array). The shader converts the loaded 8-bit integer values to float for
 readback; every such value is exactly representable, including signed negatives. Wider integers are not covered.
-Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The nonzero masks cycle from
-`0xf` through `0x1`–`0xe`; 90 programs cover all 15 masks for each of the six default formats. Selected channels
-are packed into consecutive destination registers, while unwritten registers keep initialized sentinel values.
+Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The mask cycle starts with
+`0xf` and `0x5`, so the default eight programs already exercise packing across a gap. With 90 programs, each of the
+six default formats exercises all 15 nonzero masks. Selected channels are packed into consecutive destination
+registers, while unwritten registers keep initialized sentinel values.
 The packing model follows the image VGPR usage description in AMD's
 [RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
 the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
@@ -917,6 +932,34 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
   - Wave32 and wave64 produce identical results across all 1,088 kernels (0 differences).
   - The translator implements the IEEE mode 0 bit moves, which is exact on hardware.
 
+*Results on RDNA4 (RX 9070, gfx1201, RADV/Mesa 26.2.6, the Linux DRM launcher, AMD clang 23.1.5, `main` + this
+change).* The hardware gate is per family now: `f16` also runs on gfx1170 and gfx12xx (its kernels assemble clean
+for gfx1150, gfx1170 and gfx1201 — 300 programs per wave size each, 0 rejected; the generator's op_sel lines are
+respelled by `asm.opsel16_spelling` there, as the runner always has), and `mem` runs on gfx1150 and gfx1170
+(300 programs per wave size, every op kind, 0 rejected) and, in GFX12 spelling, on gfx12xx (below).
+`f16` numbers: `--programs 500` (1,000 kernels, wave32 and native wave64) 1,000/1,000 match, 0 mismatches,
+0 assembler rejections; the negative control caught every perturbation (100/87/85/42/31/90 of 100 programs for
+hi_zero, opsel_dst_ignored, pk_swapped, min_is_max, pack_swapped, i16_opsel_ignored). gfx1201 is not RDNA2: the
+match supports the model and settles nothing about the console.
+
+*`mem` on RDNA4 (RX 9060 XT, gfx1200, AMD Windows driver 26.11.2, the HIP launcher, AMD clang from rocm-sdk-core
+10.0.0).* The generator's GFX10/GFX11 text is respelled for gfx12 (`gfx12_lines`): a MUBUF soffset is `null`, not the
+literal `0`, which is what "operands are not valid for this GPU or mode" rejected on every `buffer_load/store_b*`;
+`s_waitcnt_vscnt` becomes `s_wait_storecnt`, and the legacy `s_waitcnt vmcnt(0)` / `lgkmcnt(0)`, which still
+assemble but to the old encoding, become `s_wait_loadcnt` / `s_wait_kmcnt`; `buffer_gl0_inv` and `buffer_gl1_inv`
+become `global_inv scope:SCOPE_DEV`. The V#s are unchanged: Mesa's `gfx12-rsrc.json` keeps word 1
+(BASE_ADDRESS_HI, STRIDE) and word 3's DST_SEL, FORMAT (the GFX11 table, 32_FLOAT = 22) and OOB_SELECT bits, adding
+STRIDE_SCALE and compression fields that stay 0. The gfx10, gfx11 and translator text is byte-identical to before.
+Seeds 2, 3 and 4 × 2,000 programs × wave32 and native wave64: **12,000 of 12,000 match, 0 mismatches, 0 assembler
+rejections**, so the four OOB_SELECT bounds rules of "Buffer bounds checking" hold on gfx1200 as measured on RDNA2
+and gfx1150. Negative control (`--programs 300`): unperturbed 0 of 600; caught 312, 33, 211, 39, 19, 353, 129 and 53
+(oob_ignore_mode, mode0_no_stride, idx_unchecked, soffset_unchecked, whole_access, oob_load_keeps, sbuf_no_bound,
+sbuf_stride_ignored). `--hw-sync` at seed 5 (500 programs, both wave sizes): `scalar` (the default) and `full`
+1,000 of 1,000, `sinv` 964, `min` 955, `none` 935. With the scalar loads left out (`--skip-op sload --skip-op sbuf`)
+`none` gives 1,000 of 1,000, and with `s_load` alone 979: on gfx1200, as on GFX11 above, a vector load after a store
+of the same thread needs no wait, and a scalar load after vector stores needs both the store wait and the
+scalar-cache invalidation.
+
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
@@ -1107,6 +1150,39 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   - `--wave64-emulate auto` stays native on that driver, because it can crash on emulated LDS code (#857).
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
+### Wave and cross-lane ops on the CPU (`tools/wave_diff.py`)
+
+The same family as `crosslane_fuzz.py`, without a GPU or llvm-mc, so it can run wherever the translator tests run.
+The reference is `cf_ref.WaveMachine` (FUZZ-8) extended in `wave_diff.WaveRef` with the instructions it leaves out:
+`v_readlane`, `v_readfirstlane`, `v_writelane`, `ds_bpermute_b32` (per 32-lane half, an inactive source reads 0),
+`v_permlane16/x16` (FI = 0 with an inactive source leaves vD, as measured above), `s_bcnt0/1` and `s_ff0/1`
+(`_b32`/`_b64`, constants sign-extended to the operand width) and `s_not`. Each rule is written next to its instruction.
+The translated side is `spirv_mini_interp.run_workgroup`, every lane of the wave in one subgroup of the wave's size, and
+all 12 dwords every lane stores are compared (four VGPRs, two masks, VCC and the final EXEC as each lane's bit, four
+scalars). Programs are straight-line wave32 and wave64 compute under random EXEC (`v_cmpx`, saveexec, constants).
+
+By default the generator keeps lane masks and 64-bit data in separate registers and only issues `v_permlane` with every
+lane on, so a default run is a regression check. Two known gaps on `main` are opt-in: `--masks-as-data` (#210, #293) and
+`--permlane-partial` (SHADER-74, #580).
+
+Results (`--max-ops 16`, half wave32, half wave64, nothing skipped): it found `s_and_b32 exec_lo, exec_lo, K` in
+wave32 and `s_ff0_i32_b64` of a negative constant (#1409), both fixed on `main` since; on `main` 7b7d73f8, 600 of
+600 match (seeds 401 to 403).
+
+For one case from a default wave32 run, `tools/wave_trace.py` writes a self-contained HTML report. Use the seed,
+zero-based case index, and `--max-ops` from `wave_diff.py --wave 32`. The report compares all 32 lanes after
+initialization and after each subsequent instruction. Select a register or jump to the first observed mismatch.
+
+```powershell
+python -I tools/wave_trace.py --seed 1 --case 0 --max-ops 12 --out wave.html
+```
+
+Each checkpoint re-translates a shorter program with the same observation epilogue, so liveness and lowering can
+change between checkpoints. The first mismatch identifies an observed prefix. The final checkpoint runs the full
+original case. The tool uses synthetic programs and the CPU interpreters above. It writes a report for mismatches
+and unavailable checkpoints as well. Exit 1 means a mismatch was observed, 2 means the comparison was incomplete
+or the command failed, and 0 means all checkpoints matched.
+
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
 `--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
@@ -1281,8 +1357,61 @@ interpreter that quiets the NaN. That form is left out unless `--known` (`class-
 ```
 python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
 python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tools/fmisc_diff.py --oracle hw,vk --programs 600 --seed 11 --max-ops 8 [--wave 64]
 python -I tests/test_fmisc_diff.py
 ```
+
+`--oracle hw,vk` also runs the translated programs on a real Vulkan GPU (`tools/vk_fuzz_run.py`: llvm-mc for gfx1013,
+`rdna2spirv.py`, `runtime/build/vk_compute_test`, `LEONIDA_VK_DEVICE`, `--build DIR`) as one wave of 32 or, with
+`--wave 64`, 64 identical lanes (the lane masks as 64-bit pairs; the hardware kernels run in the same wave size), and
+judges lane 0's four words against the hardware's, not the reference's: the interpreter cannot see a driver's denormal,
+NaN and rounding rules. The seeds are computed from the buffer fill at run time (`--vk-constants` keeps them as
+literals), because the AMD Windows driver (26.10.1) folds an ordered compare of a literal NaN to true in a wave32
+pipeline (`v_cmp_lt_f32 vcc_lo, -10.0, NaN`, fine in wave64 and on the RTX 5080; with run-time operands it is right).
+Differences are `denormal` (the reference declines the program for a denormal: f32 denormals are left to the driver),
+`omod_neg_zero` (an output modifier made the hardware's -0 a +0, the translated -0 stayed; #1281) and `mismatch`,
+which fails the run. Seeds 11 to 13, 600 programs each, up to 8 ops: Radeon gfx1036 wave32 597 match, 3 omod_neg_zero;
+wave64 593 match, 3 denormal, 4 omod_neg_zero; RTX 5080 wave32 595 match, 3 omod_neg_zero, 2 denormal; no mismatch.
+
+### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` and `fmisc_diff`
+
+These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. `f32_fuzz`
+has no Vulkan path (its GPU oracle is `--oracle hw`, above). With
+`--oracle hw,vk` each program also runs through llvm-mc (gfx1013), `rdna2spirv.py` and `runtime/build/vk_compute_test`
+(`tools/vk_fuzz_run.py`; `--build DIR`, `--work DIR`, `LEONIDA_VK_DEVICE`) as one wave, and its words are judged against
+the hardware's words from a kernel run in the same wave size (`--wave 32` or `--wave 64`; wave64 needs native 64-wide
+subgroups, so the Radeon and not the RTX 5080). `pk16_diff`, `vint_diff` and `fmisc_diff` run identical lanes and judge
+lane 0, `sdwa_diff` too (its VCC seed differs per lane), `wint_diff` runs its per-lane programs in the wave size they were
+generated for and judges every lane. The `v_mov_b32 vN, K` seeds of the lane-identical tools become `K ^ 0xEEEEEEEE`
+xor the buffer fill vk_compute_test leaves in the output (`--vk-constants` keeps literals): the AMD Windows driver
+(26.10.1) folds an ordered compare of a literal NaN to true in a wave32 pipeline, which says nothing about a shader given
+a NaN at run time.
+
+```
+python -I tools/pk16_diff.py --oracle hw,vk --programs 500 --seed 201 --max-ops 8 [--wave 64]
+python -I tools/vint_diff.py --oracle hw,vk --programs 500 --seed 203
+python -I tools/sdwa_diff.py --oracle hw,vk --family f16 --programs 500 --seed 211
+python -I tools/wint_diff.py --oracle hw,vk --wave both --programs 400 --seed 221
+```
+
+Fresh seeds, 400 to 500 programs each (AMD Radeon iGPU gfx1036, driver 26.10.1, and NVIDIA GeForce RTX 5080, driver
+616.92; the f16 SDWA programs also count `nan`: the reference declines an f16 NaN, the hardware kernels run with IEEE on):
+
+| tool | Radeon wave32 | Radeon wave64 | RTX 5080 wave32 |
+|---|---|---|---|
+| `pk16_diff` | 492 match, 8 mismatch | 492 match, 8 mismatch | 500 match |
+| `vint_diff` | 500 match | 500 match | 500 match |
+| `sdwa_diff --family int` | 500 match | 498 match, 2 mismatch | 500 match |
+| `sdwa_diff --family f16` | 499 match, 1 nan | 498 match, 2 mismatch | 490 match, 10 nan |
+| `wint_diff` | 398 match, 2 mismatch (wave32 and wave64 programs together) | | 400 match |
+
+The pk16 mismatches were `v_med3_i16` with a constant operand (seven of eight on wave64, five of eight on wave32; the
+rest `v_pk_*` or `v_min_i16`): the AMD driver returned a bound instead of the middle value for the translated
+min/max/clamp median (fixed by the sum-minus-min-and-max form, GPU test `cs_med3_i16`). The others are Radeon-only and
+not fixable in the translator as far as measured: `v_not_b32_sdwa v4, v3 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+src0_sel:BYTE_0` with v3 = 0xffff gives 0xffffff00 where the hardware gives 0x0000ff00 in a wave64 pipeline (the same
+with the field extracts written as shifts and a mask), and `v_cvt_f32_f16_sdwa ... dst_sel:WORD_1` of an f16 denormal
+differs in the low bits of the result.
 
 ### binary64 VALU on the CPU and Vulkan (`tools/f64_diff.py`, FUZZ-55)
 
@@ -1358,6 +1487,41 @@ python -I tests/test_f64_diff.py
 
 The skips are counted by reason: subnormal FTZ, implementation-defined binary64 `InverseSqrt`/`Sqrt` precision,
 non-finite scaled FMA, and translator-rejected directed rounding. The compared cases had no mismatches.
+
+### Output modifiers of the binary64 and f16 division ops (`tools/f64_omod_probe.py`)
+
+`tools/f64_omod_probe.py` measures what `mul:2`, `mul:4`, `div:2` and `clamp` do to six VOP3 results: the binary64
+conversions `v_cvt_f64_i32` and `v_cvt_f64_u32`, `v_cvt_f32_f64` (an f32 destination), `v_frexp_mant_f64`,
+`v_div_fixup_f64` and `v_div_fixup_f16`. Each case is measured plain and with each modifier in the same kernel launch,
+so the probe compares the modifier's effect and not the semantics of the op. A hand-written kernel writes the whole
+destination (both words for binary64, the low half only for the 16-bit form, as the ISA defines) and runs once in
+wave32 and once in wave64, which must agree word for word. It needs `tools/hw_oracle` on a GFX10 AMD GPU: the kernels
+set their own MODE from the descriptor, and a device of another family is reported as unavailable, since the gate was
+measured on RDNA2. It reads no game files.
+
+The five MODEs are `game_i0_d3` (the game's, and the translator's: IEEE 0, `denorm_mode_16_64 = 3`,
+`denorm_mode_32 = 0`, DX10_CLAMP 1), `i0_d0`, `i1_d3`, `i1_d0` and `i0_d3_f32keep` (`denorm_mode_32 = 3`). The gate
+turns out to be **per result precision, not per instruction family**: the f32 result of `v_cvt_f32_f64` follows
+`denorm_mode_32` and scales whenever it is 0, while the f16 and binary64 results scale only with IEEE 0 and
+`denorm_mode_16_64 = 0` and ignore the modifiers in the game's MODE. `clamp` applies in every MODE. That is why
+`tools/rdna2spirv.py` keeps only `clamp` for these destinations, and the rows for these ops in `docs/design.md` carry
+the measurement.
+
+`--modes` takes a comma-separated subset of the five (all by default), `--waves` the wave sizes (`32,64` by default),
+`--hw-arch` the architecture handed to `tools/hw_oracle`, and `--json` a path for the report: the device, the
+architecture, the modes, the wave sizes, the modifier forms, the ops and the counts `scaling_gated_on`,
+`scaling_gated_off`, `scaling_changed_value`, `clamp_changed_value`, `mismatches` and `wave_diffs`, with the first
+cases of each. `--self-test` checks the model's own cases without a GPU. Exit 0 when every word matches the model and
+the wave sizes agree, 1 on a mismatch or a wave difference (the first cases are printed), 2 on a CLI or harness error
+and 77 when the oracle or a GFX10 device is missing. `tests/test_f64_omod_probe.py` covers the gate and the CLI with a
+fake oracle.
+
+```
+python -I tools/f64_omod_probe.py                  # all five MODEs, wave32 and wave64
+python -I tools/f64_omod_probe.py --waves 64 --json f64_omod.json
+python -I tools/f64_omod_probe.py --self-test
+python -I tests/test_f64_omod_probe.py
+```
 
 **Default-mode DX9 multiply regression.** `v_mul_legacy_f32` now explicitly flushes each f32 operand before the
 DX9 `0 * anything => +0` override, and flushes the nonzero product before its VOP3 output modifier. The output is
@@ -1713,6 +1877,55 @@ on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error ke
 probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
 MODEs), including the 28 near ties.
 
+### Division fixup (`tools/div_fixup_diff.py`)
+
+No other fuzzer generates `v_div_fixup_f16`, `v_div_fixup_f32` or `v_div_fixup_f64`. `tools/div_fixup_diff.py`
+runs them through the translator and `tests/semantic/spirv_mini_interp.py`, against a model of the `docs/design.md`
+rows that works on the operand bits and shares no code with the translator, and compares the four exported words bit
+for bit. The model:
+
+- `abs` then `neg` act on the sign bit of S0, S1 and S2, NaNs included.
+- f32 reads an S1 or S2 denormal as a zero of its sign and keeps an S0 denormal. f16 and f64 keep every denormal.
+- The first rule that holds gives the result: NaN(S2), NaN(S1), 0/0 or inf/inf (the negative quiet NaN), a zero
+  numerator or an inf denominator (zero), a zero denominator or an inf numerator (inf), the exponent cutoff
+  (`exp(S2) - exp(S1)` at most -151 on f32 and -1076 on f64, none on f16; zero), NaN(S0) (inf), S0's magnitude.
+  The sign is sign(S1) ^ sign(S2).
+- On f32, `mul:2`/`mul:4`/`div:2` scale the result, then `clamp` takes a NaN or any negative value to +0.
+- On f16 and f64, `mul:2`/`mul:4`/`div:2` change nothing: the `docs/design.md` row (#6314, measured on gfx1036 with
+  `tools/f64_omod_probe.py`) drops the scaling under `denorm_mode_16_64 = 3`, the game's `MODE`, while an f16 `clamp`
+  still saturates. The measured inputs are normal values; the reference applies the row to every result.
+
+`tests/test_div_fixup_diff.py` pins the model to the 73 gfx1036 rows of `tests/semantic/test_alu_div_fixup_f32.py`
+and to the f16 and f64 rows of `test_alu_div_fixup.py`, the measured exponent cutoffs among them.
+
+Sources are VGPRs, SGPRs, a literal (not on f64) and integer and float inline constants, within the GFX10 literal and
+constant-bus limits. An f64 source is a VGPR pair (odd first registers too), an SGPR pair or an inline constant, and
+`0.15915494309189532` is the binary64 1/(2 pi). Modifiers are `neg`/`abs`, `op_sel` on the f16 register sources and
+the destination, `clamp` on f16 and f32, and the output multipliers on all three. Not generated: a literal on f64
+(#3791 moves it to bits 63:32) and `clamp` on f64 (the translation needs Float64, which the interpreter does not run).
+
+An f32 NaN that went through an output multiplier matches any NaN. Some programs are counted as not judged, with the
+reason:
+- an f64 exponent cutoff that depends on how a denormal's exponent counts (only normal operands were measured);
+- an output multiplier on -0 without `clamp` (the hardware gives +0, not modelled), or on an f32 denormal;
+- `clamp` of a positive f32 denormal, of an f16 -0 or of an f16 NaN (`FClamp` of a NaN is undefined);
+- reading part of an f32 NaN whose payload is not modelled.
+
+Stages:
+1. A sweep of every encodable source-kind combination of each op.
+2. An edge grid: special values as S1 and S2 under five S0 values, the exponent cutoff one below, at and one above
+   (also against a NaN or inf S0, and on f64 with a denormal numerator), `abs`/`neg` on every kind of value, and
+   the output modifiers on each rule's result (f16 multipliers in both destination halves, with and without `clamp`).
+3. Random seeded programs, which read earlier results, f64 halves as f32 or f16 values included.
+
+A translator skip exits 1, as a mismatch does.
+
+```
+python -I tools/div_fixup_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/div_fixup_diff.py --ops v_div_fixup_f64 --programs 1000
+python -I tests/test_div_fixup_diff.py
+```
+
 ### `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32` denormal flush on RDNA1 (`tools/mad_denorm_probe.py`, SHADER-340)
 
 `docs/design.md` ("Denormal flush in `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32`") had no hardware measurement: GFX10.3+
@@ -2027,8 +2240,19 @@ and a vec4 at every input location), the runtime's bindless set 0 with only its 
 push-constant block and 32x32 `RGBA32F` targets cleared to -1. Everything is identical on every GPU, so the same
 sample can be run on each and compared; `ps_sweep.py compare` classifies each shader: OK on both, differs beyond
 tolerance (1e-3 absolute plus relative), NaN or all-zero on one GPU only, fails on one GPU, fails on both, timeout.
+When both workers exit successfully, `compare` requires matching target counts (1–8) and exactly 16,384 bytes per
+target in each raw file (32 × 32 pixels × 16 bytes). A missing file, a wrong byte length or an invalid or mismatched
+count is reported as `invalid readback`, not as a GPU result. Failed and timed-out draws are classified by exit
+code without reading either file. The size check establishes completeness; this command still compares float values
+with tolerance, not byte-for-byte equality.
 Variant `t` (`VKS_TEX=1`) replaces the fallback images with an 8x8 gradient (2D, 2D array, 1D, 3D) and a linear
 sampler so sampled values are not all zero.
+
+Warning: a few sampled shaders hang NVIDIA GPUs with the zeroed heap (see "Fails on one GPU, NVIDIA" below). The
+`--timeout` of `ps_sweep.py run` only bounds the wait on the host side; the driver resets the GPU (TDR). On a GPU that
+also drives the display the desktop freezes until each reset (a tester saw five in six minutes on an RTX 3060 around
+shaders 120 to 310 of the 480). Run it on a GPU with no display attached, or expect a freeze of a few seconds per hang;
+`--lo`/`--hi`/`--only` run part of the sample.
 
 RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixel shaders (seed 20261122):
 
@@ -2061,6 +2285,48 @@ RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixe
   seeded heap was tried and abandoned, because a pointer read from float data is a wild address and takes NVIDIA's
   device down.
 
+**With the fallbacks (`--bary-fallback` plus the MinLod fallback of #4642, same 480 shaders, variant z).** The same sample was
+retranslated with both flags and drawn through `<name>.bary_gs.spv` where a shader reads raw barycentrics (`VKS_GS`,
+`tools/bary_fallback_gs.py`). The Intel UHD 770 creates 440 of the 480 (265 before; the 207 that needed
+`fragmentShaderBarycentric` or `shaderResourceMinLod` are gone), 32 time out (zeroed-heap loops, which the same
+translation also hits on the RTX 4080 SUPER), and 8 are not translated (`computed I/J pair under --bary-fallback`,
+#3898). Intel against NVIDIA on the same fallback translation: 434 OK on both, 0 differ, 4 NVIDIA device losses
+(the unterminated loop above), 8 not translated, 34 timeouts on both. Intel with the fallbacks against NVIDIA with
+the default translation: 373 OK, 53 differ by more than 0.1 and 8 are NaN on one side. The same 61 differ between the
+two translations on NVIDIA alone, so it is the translation, not the GPU. **Cause (counted on the same 480 translated
+again, `--bary-fallback` alone, without the MinLod flag of #4642, against the default):** 199 modules differ between the two translations, 190 that read a
+16-bit interpolant (`v_interp_p1ll/p1lv/p2_f16`) and the 9 that read raw barycentrics; the other 273 translated under
+both are byte-identical, so ordinary `v_interp_p1/p2/mov_f32` is not translated differently (the remaining 8 are not
+translated under the fallback). `--bary-fallback` has no `PerVertexKHR` inputs, so a 16-bit interpolant is read as the
+smooth f32 of its packed word (design.md, "16-bit interpolation"); `--f16-interp-fallback` is its companion, and
+`make_game.py` turns it on with it wherever the device has no per-vertex inputs, as an Intel UHD has none. The sweep
+used the first flag without the second, and its generated vertex shader wrote the decoded halves nowhere. The synthetic
+`ps_interp_f16_high` drawn with `vs_f16_pack` agrees: with `--bary-fallback` alone its f16 halves are off by 0.984 on
+both GPUs, with both flags and by default they are within 2e-3 on both, and `ps_interp_f32_mods` / `ps_interp_mov_mods`
+(plain f32 and mov reads) are exact with `--bary-fallback`. `ps_sweep.py` now builds the vertex shader of a pixel
+shader with `f16_halves` in its index entry so that the halves are decoded from the same words a default translation
+reads per vertex. An exhaustive follow-up on all `480` sampled shaders (`--seed 20261122`, `main` at `dde82f27e`)
+and all `12,101` PS confirmed this on an AMD Radeon RX 6650 XT (RDNA2, Windows 11 driver `32.0.21045.29003`,
+`vk_ps_sweep` variant `z`, `--timeout 30`): `29` of `12,101` PS use `MinLod` (`image_sample_d_cl`, `273` occurrences;
+`10` also have `v_interp_*_f16`, `0` read raw barycentrics), and `0` of the `480` sampled PS declare `MinLod`, so
+the MinLod fallback plays no part in this `480`-shader difference. Across the `480` shaders, `272` modules are
+byte-identical across all three translations, `10` are refused (`computed I/J pair under --bary-fallback`), and
+`198` differ (`186` reading `v_interp_*_f16` — all `186` using `high` — `12` reading raw barycentrics with
+`.bary_gs.spv`, `0` combining both in the sample; across all `12,101` PS, `5` combine both, of which `3` translate
+under `--bary-fallback --f16-interp-fallback` + `.bary_gs.spv` and `2` hit `computed I/J pair under --bary-fallback`).
+On the `198` differing shaders on the RX 6650 XT, `default` vs `--bary-fallback` alone gave `90` OK on both (all `12`
+raw-bary GS draws plus `78` `v_interp_*_f16`), `54` differing beyond tolerance (`53` gross `>0.1`, `1` moderate
+`>1e-2`), `9` NaN or zero on one side (`8` NaN on `default` only with `371`/`507`/`960` NaNs, `1` zero on `default`
+only), `12` driver crashes on both (`0xC0000005`, unchanged with an 8 MiB stack), and `33` timeouts; all `63`
+differing/NaN/zero draws are `v_interp_*_f16` shaders where the default sweep vertex shader without `f16_halves` wrote
+smooth `[0, 1]` `f32` bits that `PerVertexKHR` `UnpackHalf2x16` interpreted as negative or large `f16` values (feeding
+`sqrt`/`log`/`pow`), whereas `--bary-fallback` alone read the positive smooth `f32` values directly. Re-running the
+same `198` shaders with `--bary-fallback --f16-interp-fallback` gave `153` OK on both (`141` `v_interp_*_f16` + all
+`12` raw-bary GS), `0` differing, `0` NaN/zero mismatch, `12` failures on both, and `33` timeouts, with `153/153`
+completing draws (`89` non-clear exact + `64` clear-only exact across `573/573` targets) bit-for-bit identical under
+`ps_sweep.py compare --exact`. All `3` whole-corpus shaders combining raw barycentrics and `v_interp_*_f16` also draw
+bit-for-bit identically (`3/3` draws, `11/11` targets) against `default` on the RX 6650 XT.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
@@ -2078,6 +2344,10 @@ covers the operations most shaders use. Then add, in order:
    loops, two-entry cycles), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
    and by `tests/semantic/spirv_wave_interp.py` (every invocation of a subgroup, with structured
    reconvergence), compared lane by lane in both the structured and the dispatch-loop form.
+   The corpus-side counterpart is `tools/ab_control_flow.py`: it renders branchy pixel shaders
+   translated both ways (real loops and conditionals, and `--dispatch-loop`) and compares the two
+   images byte for byte. It needs a finished shaders stage and `runtime/build/vk_texture_test`, and
+   writes the outcome of each shader to `outcomes.tsv`.
 4. **LDS, global memory, buffers and images.** These need a memory model and descriptor setup; the
    existing `vk_compute_test`/`vk_store_test`/`vk_texture_test` programs show the shape.
 5. **Wave operations.** Ballot, shuffles, DPP, `readlane`/`writelane`, `permlane`, `mbcnt`, and the

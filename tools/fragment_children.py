@@ -43,12 +43,16 @@ import json
 import mmap
 import multiprocessing
 import os
+import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I keeps the script directory off sys.path
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import skin_streams as ss  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -332,6 +336,39 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
     return total
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(report, fh, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".fragment_children-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive", help="RPF9 archive to scan")
@@ -348,8 +385,15 @@ def main(argv=None):
         print(f"error: {a.archive} is not a file", file=sys.stderr)
         return 2
     for out in (a.records, a.json):
-        if out and (os.path.isdir(out) or ss.same_output_path(out, a.archive)):
+        if not out:
+            continue
+        if os.path.isdir(out) or ss.same_output_path(out, a.archive):
             print(f"error: {out} is a directory or the input", file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(out))
+        if not os.path.isdir(parent):
+            # checked before the scan: the scan can run for hours and would raise only at write time
+            print(f"error: {out} is in a folder that does not exist: {parent}", file=sys.stderr)
             return 2
     t0 = time.time()
     stats = scan_archive(a.archive, a.start, a.end, a.jobs, a.records, lambda text: print(text, flush=True))
@@ -357,8 +401,7 @@ def main(argv=None):
     for key, value in stats.items():
         print(f"  {key:26s} {value:10d}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(stats, fh, indent=1)
+        write_json_report(a.json, stats)
     return 0
 
 

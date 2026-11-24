@@ -22,6 +22,7 @@ triangles (or lines, points) in emission order.
 Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
+import io
 import json
 import os
 import re
@@ -43,10 +44,15 @@ class Unsupported(Exception):
     pass
 
 
+def _assembly_lines(text):
+    # Only physical line endings separate instructions; Unicode separators can be part of a quoted name.
+    return (line.removesuffix("\n") for line in io.StringIO(text, newline=None))
+
+
 def parse(text):
     """defs: id -> (opcode, operands) for '%id = OpX ...' lines; deco: id -> its OpDecorate operand strings."""
     defs, deco = {}, {}
-    for ln in text.splitlines():
+    for ln in _assembly_lines(text):
         m = re.match(r"\s*(%\w+) = (Op\w+)(.*)$", ln)
         if m:
             defs[m.group(1)] = (m.group(2), m.group(3).split())
@@ -185,10 +191,11 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     out = []
     entry_label = None
     cur_block = None
+    emit_split = set()
     block_tail = {}
     main_start = None
     state = "header"        # header -> main_entry -> main_vars -> main -> other
-    for ln in text.splitlines():
+    for ln in _assembly_lines(text):
         s = ln.strip()
         if s == "OpCapability Geometry":
             continue
@@ -326,6 +333,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                     f"{lbl_end} = OpLabel"]
             if cur_block is not None:
                 block_tail[cur_block] = lbl_end
+                emit_split.add(cur_block)
             continue
         if s == "OpEndPrimitive":
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
@@ -338,6 +346,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             n, q = tmp(), tmp()
             out += [f"{n} = OpLoad {uint} %gsc_n",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} %gsc_metabase", f"OpStore {q} {n}"]
+        if s.startswith("OpLoopMerge ") and cur_block in emit_split:
+            # Splitting a loop header with OpSelectionMerge moves OpLoopMerge into the merge block while
+            # back-edges still target the original header label, violating SPIR-V structured CFG rules.
+            raise Unsupported("OpEmitVertex in a loop header before OpLoopMerge")
         if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
             raise Unsupported(s)
         out.append(s)

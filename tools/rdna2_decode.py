@@ -16,6 +16,8 @@ import json
 import os
 import struct
 import sys
+from collections.abc import Iterator
+from io import StringIO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -139,7 +141,7 @@ _SOPP_BRANCHES = frozenset({
 
 # SOPP instructions that take no operand at all.
 _SOPP_NO_OPERAND = frozenset({
-    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm",
+    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata",
     "s_wakeup", "s_endpgm_saved", "s_code_end", "s_endpgm_ordered_ps_done",
 })
 
@@ -361,11 +363,12 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     if name.startswith("image_atomic_"):
         return (base + 1) // 2 if a16 else base
     # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp.
-    base_name = name[:-3] if name.endswith("_cl") else name
-    has_cl = name.endswith("_cl")
-    fixed32 = 0
-    if base_name.endswith("_o") or "_o_" in base_name:
-        fixed32 += 1
+    has_o = name.endswith("_o") or "_o_" in name
+    base_name = name[:-2] if name.endswith("_o") else name
+    has_cl = base_name.endswith("_cl")
+    if has_cl:
+        base_name = base_name[:-3]
+    fixed32 = 1 if has_o else 0
     if "_b" in base_name and not base_name.startswith("image_bvh"):
         fixed32 += 1
     if "_c" in base_name and not base_name.startswith(("image_atomic", "image_get")):
@@ -976,7 +979,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
             elif fn == "SRC2":
                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
-        if op_sel:
+        if name in ("v_permlane16_b32", "v_permlanex16_b32"):
+            # These two use op_sel bits 0 and 1 as FI and BOUND_CTRL, not as half selects. llvm-mc prints just that
+            # pair, and nothing when both are 0, whatever bits 2 and 3 hold (LLVM 21.1.8, gfx1013).
+            if op_sel & 3:
+                mods.append(f"op_sel:[{op_sel & 1},{(op_sel >> 1) & 1}]")
+        elif op_sel:
             # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
             nbits = nsrc if opc < 0x100 else (nsrc + 1)
             bits = [(op_sel >> i) & 1 for i in range(nsrc)]
@@ -1048,17 +1056,20 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = tbl[opc]
         is_atomic = "_atomic_" in name
         has_saddr = seg in (1, 2)
-        saddr_off = saddr in (0x7D, 0x7F)  # GFX10 null (125) or legacy 127 => off (64-bit vaddr)
+        saddr_off = saddr in (0x7D, 0x7F)  # GFX10 null (125) or ST-mode/legacy 127 => off
         args = []
         for fn, nr, _ in spec:
             w = _width(nr, wave32)
             if fn == "VDST":
-                if is_atomic and not glc:
+                if (is_atomic and not glc) or (lds and seg in (1, 2)):
                     continue
                 args.append(_vreg(vdst, w))
             elif fn == "ADDR":
-                aw = 2 if (seg == 0 or (seg == 2 and saddr_off)) else 1
-                args.append(_vreg(addr, aw))
+                if seg == 1 and saddr != 0x7D:
+                    args.append({"k": "special", "t": "off", "neg": False, "abs": False})
+                else:
+                    aw = 2 if (seg == 0 or (seg == 2 and saddr_off)) else 1
+                    args.append(_vreg(addr, aw))
             elif fn == "DATA":
                 args.append(_vreg(data, w))
             elif fn == "SADDR" and has_saddr:
@@ -1320,7 +1331,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             tname = f"param{tgt - 32}"
         else:
             tname = f"tgt{tgt}"
-        args = [{"k": "target", "t": tname}]
+        # shader_ir.parse_line reads `null` as the special register wherever it stands, the export target included,
+        # so the decoded instruction says the same and compares equal to its own printed line parsed back.
+        args = [{"k": "special" if tname == "null" else "target", "t": tname}]
         if compr:
             # Compressed export: en bit 0/1 enables vsrc0 (printed twice), bit 2/3 enables vsrc1 (printed twice).
             for pair in (0, 1):
@@ -1346,7 +1359,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
     return None, 4
 
 
-def _format_operand(a: dict) -> str:
+def _format_operand(a: dict, hex_imm: bool = False) -> str:
     k = a["k"]
     if k in ("vgpr", "sgpr"):
         p = "v" if k == "vgpr" else "s"
@@ -1362,7 +1375,7 @@ def _format_operand(a: dict) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if v >= 100 else str(v)
+        s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
@@ -1386,10 +1399,12 @@ def format_insn(ins: dict) -> str:
     op = ins["op"]
     args = ins["args"]
     mods = ins["mods"]
+    hex_imm = op == "s_ttracedata_imm"
     if op == "exp" and args:
-        head = f"{op} {_format_operand(args[0])} " + ", ".join(_format_operand(x) for x in args[1:])
+        head = f"{op} {_format_operand(args[0], hex_imm)} " + ", ".join(
+            _format_operand(x, hex_imm) for x in args[1:])
     elif args:
-        head = f"{op} " + ", ".join(_format_operand(x) for x in args)
+        head = f"{op} " + ", ".join(_format_operand(x, hex_imm) for x in args)
     else:
         head = op
     if mods:
@@ -1399,25 +1414,41 @@ def format_insn(ins: dict) -> str:
     return f"\t{head:<40s}; encoding: [{enc_str}]"
 
 
-def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
-    """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
-    insns = []
-    invalid = 0
+def _iter_insns(code: bytes, wave32: bool, code_start: int, mcpu: str) -> Iterator[dict | None]:
+    """Yield each decoded instruction, or None for each invalid word counted."""
     off = 0
     while off < len(code):
         ins, nbytes = _decode_one(code, off, wave32, mcpu)
         if ins is None:
-            invalid += 1
             off += max(4, nbytes)
-            continue
-        ins["pc"] = code_start + off
-        insns.append(ins)
-        off += nbytes
+        else:
+            ins["pc"] = code_start + off
+            off += nbytes
+        yield ins
+
+
+def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
+    """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
+    insns = []
+    invalid = 0
+    for ins in _iter_insns(code, wave32, code_start, mcpu):
+        if ins is None:
+            invalid += 1
+        else:
+            insns.append(ins)
     return {"name": name, "code_start": code_start, "insns": insns, "invalid": invalid}
 
 
 def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
-    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`."""
-    info = decode_bytes(code, mcpu=mcpu, wave32=wave32, code_start=code_start, name=name)
-    lines = [format_insn(ins) for ins in info["insns"]]
-    return "\n".join(lines) + ("\n" if lines else ""), info["invalid"]
+    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`.
+
+    The listing contains only instructions. `name` is accepted for caller compatibility.
+    """
+    invalid = 0
+    with StringIO() as listing:
+        for ins in _iter_insns(code, wave32, code_start, mcpu):
+            if ins is None:
+                invalid += 1
+            else:
+                listing.write(f"{format_insn(ins)}\n")
+        return listing.getvalue(), invalid

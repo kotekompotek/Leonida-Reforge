@@ -13,11 +13,19 @@ Usage:
 With ``--probe`` each stream is written to a temporary file and passed to
 ``ffprobe``; the extra columns say only whether that ffprobe build can decode
 the stream. A missing ffprobe leaves the base columns unchanged.
+A single named file that is neither a Bink 2 stream nor an RPF archive is an
+error (exit 2), not an empty index; a directory scan still reports 0 streams
+when nothing matches.
+
+A single named file has to start with ``KB2`` or an RPF header; anything else
+(an empty file, a text file, a carved chunk) cannot hold a stream and is one
+error line with exit 2, which is how a wrong path shows up.
 
 In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their own
 (``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
 that long, those bytes are counted as ``rpf_trailer`` and only the rest of the gap is
 split into zero padding and unread bytes.
+Usage: `python -I tools/bink_index.py --help` lists the options.
 """
 import argparse
 import csv
@@ -26,10 +34,15 @@ import mmap
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
@@ -288,21 +301,70 @@ def _flat(row, fields):
     return out
 
 
+def _publish_text(path, write_body, *, newline, prefix):
+    """Publish a complete regular file via a temp sibling, or write a non-regular destination directly."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline=newline) as fh:
+            write_body(fh)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline=newline, delete=False,
+        dir=parent, prefix=prefix, suffix=".tmp",
+    )
+    try:
+        with staged:
+            write_body(staged)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def write_csv(path, rows, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
-    with open(path, "w", encoding="utf-8", newline="") as fh:
+
+    def write_body(fh):
         writer = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow(_flat(row, fields))
 
+    _publish_text(path, write_body, newline="", prefix=".bink_index-")
+
 
 def write_json(path, target, rows, summary, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     streams = [_flat(row, fields) for row in rows]
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+
+    def write_body(fh):
         json.dump({"target": target, "summary": summary, "streams": streams},
                   fh, indent=1)
+
+    _publish_text(path, write_body, newline="\n", prefix=".bink_index-")
+
+
+def is_rpf_archive(path):
+    """True when *path* starts with an RPF header (``?FPR``)."""
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError:
+        return False
+    return len(header) >= 16 and header[1:4] == b"FPR"
 
 
 def same_output_path(first, second):
@@ -313,6 +375,21 @@ def same_output_path(first, second):
         return os.path.samefile(first, second)
     except OSError:
         return False
+
+
+def target_problem(path):
+    """None when a single named file is something this tool indexes, else a one-line reason.
+
+    The scan only searches the bytes for `KB2` headers, so a wrong path or a mislabelled file came back as a
+    successful scan of 0 streams. An RPF archive may hold no stream and is a real answer.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if not head:
+        return "empty file"
+    if head[1:4] != b"FPR" and not SIG.match(head):
+        return "not a Bink 2 stream (KB2) or an RPF archive"
+    return None
 
 
 def main(argv=None):
@@ -341,6 +418,15 @@ def main(argv=None):
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
+    if not os.path.isdir(a.target):
+        try:
+            problem = target_problem(a.target)
+        except OSError as error:
+            print(f"bink_index: error: cannot read {a.target}: {error.strerror or error}", file=sys.stderr)
+            return 2
+        if problem:
+            print(f"bink_index: error: {a.target}: {problem}", file=sys.stderr)
+            return 2
 
     skip_report = None
     if a.out and os.path.isfile(a.out):
@@ -350,6 +436,11 @@ def main(argv=None):
     except OSError as error:
         path = error.filename or a.target
         print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 2
+    if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
+        # A named file with no Bink 2 stream and no RPF header is a wrong path or
+        # format, not an empty index; a directory scan still reports 0 streams.
+        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
         return 2
     probe = False
     if a.probe:

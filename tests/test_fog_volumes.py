@@ -1,11 +1,14 @@
 """Synthetic unit tests for tools/fog_volumes.py (ASSET-308). No game files."""
+import concurrent.futures
 import json
 import os
 import struct
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(os.path.dirname(TESTS_DIR), "tools")
@@ -13,6 +16,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import fog_volumes as fv  # noqa: E402
+import pool_workers  # noqa: E402
 
 SYS = 0x50000000
 
@@ -108,6 +112,23 @@ def build_synthetic_fog_0x7a(volumes: list[dict]) -> bytes:
 
 
 class FogVolumesTests(unittest.TestCase):
+    def test_field_reads_stay_inside_each_volume(self):
+        raw = bytearray(build_synthetic_fog_0x7a([{"IsBox": 1}, {"IsBox": 0}]))
+        record_size = 512
+        end_field = record_size - 4
+        for at in range(0xB0, 0x1A0, 16):
+            field_hash, = struct.unpack_from("<I", raw, at)
+            if field_hash in (fv.FIELDS["Position"], fv.FIELDS["ProfileIndex"]):
+                struct.pack_into("<I", raw, at + 4, end_field)
+        for i, profile in enumerate((10, 12)):
+            struct.pack_into("<I", raw, 0x1B0 + i * record_size + end_field, profile)
+
+        rows = fv.parse_fog_volumes(raw)
+        self.assertEqual([row["ProfileIndex"] for row in rows], [10, 12])
+        self.assertEqual([row["IsBox"] for row in rows], [1, 0])
+        for row in rows:
+            self.assertNotIn("Position", row)
+
     def test_parse_and_summarize_carved_file(self):
         raw = build_synthetic_fog_0x7a([
             {"IsBox": 1, "Position": (0.0, 0.0, 0.0), "PositionOffset": (1.5, -2.0, 0.5),
@@ -230,6 +251,85 @@ class FogVolumesTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 fv.main([os.path.join(td, "missing.rpf")])
             self.assertEqual(cm.exception.code, 2)
+
+    def test_jobs_below_one_is_a_usage_error(self):
+        # A --jobs of 0 used to run with max(1, 0) = one worker and exit 0, so a caller that meant to ask for
+        # an impossible worker count got a silent sequential run instead of an error.
+        with tempfile.TemporaryDirectory() as td:
+            for bad in ("0", "-3"):
+                with self.assertRaises(SystemExit) as cm:
+                    fv.main([td, "--jobs", bad])
+                self.assertEqual(cm.exception.code, 2)
+    @unittest.skipIf(pool_workers.MAX_PROCESS_WORKERS is None, "this platform has no process-pool worker cap")
+    def test_jobs_above_the_pool_cap_ask_for_the_cap(self):
+        # ProcessPoolExecutor takes at most 61 workers on Windows (WaitForMultipleObjects' handle limit), so a
+        # --jobs of 1000 used to reach it unchanged and the run died with ValueError before the first chunk.
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "big.rpf")
+            with open(path, "wb") as f:
+                f.truncate(16 * 1024 * 1024)  # four chunks of the 4 MiB floor, so the pool path is taken
+            asked = []
+
+            class RecordingPool:
+                def __init__(self, max_workers=None, **_kwargs):
+                    asked.append(max_workers)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def map(self, fn, items):
+                    return [fn(item) for item in items]
+
+            with unittest.mock.patch.object(concurrent.futures, "ProcessPoolExecutor", RecordingPool):
+                result = fv._scan_rpf_offsets(path, jobs=1000)
+        self.assertEqual(asked, [pool_workers.MAX_PROCESS_WORKERS])
+        self.assertEqual(result, ([], 0, 0))
+
+    def test_one_chunk_input_is_scanned_without_a_pool(self):
+        # A file that fits in one chunk is scanned in the calling process, whatever --jobs says.
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "small.rpf")
+            with open(path, "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            def no_pool(*_args, **_kwargs):
+                raise AssertionError("a one-chunk input must not start a pool")
+
+            with unittest.mock.patch.object(concurrent.futures, "ProcessPoolExecutor", no_pool):
+                self.assertEqual(fv._scan_rpf_offsets(path, jobs=1000), ([], 0, 0))
+
+
+    def test_pool_is_capped_at_the_platform_limit(self):
+        # A --jobs above the worker-process limit used to reach ProcessPoolExecutor unchanged; on Windows the
+        # constructor then raises ValueError(max_workers must be <= 61). The other pool tools lower it with
+        # pool_workers.process_workers. 61 is forced here so the check does not depend on the host OS.
+        seen = []
+
+        class RecordingPool:
+            def __init__(self, max_workers=None):
+                seen.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def map(self, fn, iterable):
+                return [([], 0, 0) for _ in iterable]
+
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "big.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"\x00" * (9 * 1024 * 1024))     # three 4 MiB chunks, so the pool branch is taken
+            with mock.patch.object(pool_workers, "MAX_PROCESS_WORKERS", 61), \
+                    mock.patch.object(fv.concurrent.futures, "ProcessPoolExecutor", RecordingPool):
+                offs, complete, incomplete = fv._scan_rpf_offsets(rpf, jobs=200)
+        self.assertEqual((offs, complete, incomplete), ([], 0, 0))
+        self.assertEqual(seen, [61])
 
 
 if __name__ == "__main__":

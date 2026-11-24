@@ -18,7 +18,7 @@ Usage:
     python -I tools/buffer_format_fuzz.py --self-test
     python -I tools/buffer_format_fuzz.py --oracle hw [--mode load|store|all] [--path mubuf|mtbuf|both]
                                           [--formats 56,36,...] [--seed S] [--negative-control]
-Exit code: 0 all match, 1 a mismatch, 2 harness error, 77 no hardware oracle. Nothing here reads game files.
+Exit code: 0 all match, 1 a mismatch, 2 a usage or harness error, 77 no hardware oracle. Nothing here reads game files.
 """
 import argparse
 import json
@@ -507,7 +507,7 @@ def select_formats(spec, family="gfx11"):
         tok = tok.strip()
         code = int(tok) if tok.isdigit() else codes.get(tok)
         if code not in GFX10_NAMES:
-            raise SystemExit(f"unknown format {tok!r}; give a GFX10 code (1..77) or name such as 8_8_8_8_UNORM")
+            raise ValueError(f"unknown format {tok!r}; give a GFX10 code (1..77) or name such as 8_8_8_8_UNORM")
         out.append((code, GFX10_NAMES[code]))
     return out
 
@@ -606,25 +606,35 @@ def main():
         return self_test()
     if a.oracle != "hw":
         ap.error("--oracle hw or --self-test")
+    # An explicit --formats needs no GPU to be parsed: a typo is a usage error here, before the oracle is opened
+    # (it used to be reported only after it, or masked by "hardware oracle unavailable" without one).
+    explicit = None
+    if a.formats:
+        try:
+            explicit = select_formats(a.formats)
+        except ValueError as e:
+            ap.error(str(e))
     from hw_oracle import runner, asm
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    family = asm.family(oracle.arch)
-    fmts = select_formats(a.formats, family)
-    if family == "gfx12":
-        print("GFX12 numbers its formats again; not built here")
-        oracle.close()
-        return 77
-    print(f"hardware oracle: {oracle.device} ({oracle.arch}, {family} format numbers)")
-    if family == "gfx11":
-        print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2; "
-              f"GFX10-only codes {', '.join(map(str, GFX10_ONLY))} cannot be run here")
-        fmts = [(c, n) for c, n in fmts if n in GFX11_CODES]
-    rng = random.Random(a.seed)
     try:
+        family = asm.family(oracle.arch)
+        fmts = explicit if explicit is not None else select_formats("", family)
+        if family == "gfx12":
+            print("GFX12 numbers its formats again; not built here")
+            return 77
+        print(f"hardware oracle: {oracle.device} ({oracle.arch}, {family} format numbers)")
+        if family == "gfx11":
+            print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2; "
+                  f"GFX10-only codes {', '.join(map(str, GFX10_ONLY))} cannot be run here")
+            fmts = [(c, n) for c, n in fmts if n in GFX11_CODES]
+            if not a.negative_control and not fmts:
+                print("no requested formats can run on GFX11 (all are GFX10-only)")
+                return 77
+        rng = random.Random(a.seed)
         if a.negative_control:
             return negative_control(oracle, family, rng)
         paths = ("mubuf", "mtbuf") if a.path == "both" else (a.path,)

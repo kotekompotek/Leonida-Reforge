@@ -17,6 +17,7 @@ Format measured on the Xbox Series 1.0.2.1 common.rpf (offset 0x650000, 43,791 B
 Only header fields, aggregate counts, bucket distributions and hashed queries are
 printed or written; preset and effect names stay on the local machine. Standard
 library only.
+Usage: `python -I tools/gamedata_sps1.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -335,6 +336,12 @@ def main(argv=None) -> int:
         if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{1,8}", a.preset_hash):
             ap.error("--preset-hash expects up to eight hexadecimal digits")
         target_hash = int(a.preset_hash, 16)
+
+    # A missing input path is a usage error (exit 2), not a failed run, as in BUILD-1046.
+    for path in (a.target, a.shaders):
+        if path is not None and not os.path.exists(path):
+            print(f"ERROR: {path} does not exist", file=sys.stderr)
+            return 2
 
     try:
         if a.json:

@@ -7,9 +7,10 @@
 //
 // Nothing here goes online.
 //
-// ASSUMPTION: the console executable is not available, so the DLL name it imports these through is unknown.
-// "xgameruntime.dll" is the name the PC GDK uses. If the executable's import table names another module, register
-// the same functions under that name too; nothing else changes.
+// Measured on the retail executable (docs/runtime_imports.md, "The retail executable's runtime classes"): it does not
+// import xgameruntime.dll. Its 161 runtime thunks are linked into the image and reach the classes through
+// QueryApiImpl, as libHttpClient.GDK.dll's do, so "xgameruntime.dll" below is the only module name needed. The name
+// occurs in the image as a UTF-16 string, which would be a run-time load.
 #include <windows.h>
 
 #include <algorithm>
@@ -56,10 +57,11 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below), and XPersistentLocalStorageImpl from
-// the public docs' layout (no caller in the shipped DLLs to measure); for any other class QueryApiImpl
-// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
-// implement next.
+// XErrorImpl, XNetworkingImpl, XSystemImpl, XPackageImpl, XGameRuntimeFeatureImpl and XSystemAnalyticsImpl are
+// served (their layouts are measured, below), XPersistentLocalStorageImpl and XGameImpl from the public docs' layout
+// (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
+// query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
+// with the executable lists the interfaces to implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -246,6 +248,11 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
+
+// The same function as a DLL export: xgameruntime.lib's XGameRuntimeInitialize looks up "XErrorReport" with
+// GetProcAddress next to QueryApiImpl, the InitializeApiImpl* and UninitializeApiImpl, and refuses to initialise when it
+// is missing (retail executable: the lookup at +0x55e2b7e, the null check at +0x55e2c08, then an int3 at +0x5a91c21).
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;
@@ -480,8 +487,7 @@ std::filesystem::path persistent_storage_dir() {
     return ec ? std::filesystem::path{} : dir;
 }
 
-std::string utf8_of(const std::filesystem::path& path) {
-    const std::wstring& wide = path.native();
+std::string utf8_of(const std::wstring& wide) {
     const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
     if (n <= 0) return {};
     std::string utf8(static_cast<size_t>(n), '\0');
@@ -505,7 +511,7 @@ uint64_t folder_bytes(const std::filesystem::path& dir) {
 HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
     if (!path_size) return E_POINTER;
     *path_size = 0;
-    const std::string path = utf8_of(persistent_storage_dir());
+    const std::string path = utf8_of(persistent_storage_dir().native());
     if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     *path_size = path.size() + 1;  // with the terminating NUL
     return S_OK;
@@ -514,7 +520,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
 HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
     if (path_used) *path_used = 0;
     if (!path) return E_POINTER;
-    const std::string folder = utf8_of(persistent_storage_dir());
+    const std::string folder = utf8_of(persistent_storage_dir().native());
     if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(path, folder.c_str(), folder.size() + 1);
@@ -583,19 +589,45 @@ RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorage
 RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
 RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
 RuntimeObject& game_object();     // XGameImpl, after XPackageImpl
+RuntimeObject* const* measured_objects();  // XGameRuntimeFeatureImpl and XSystemAnalyticsImpl, after XGameImpl
+
+// The object this file hands out for a class id, or null when the class isn't one of this file's.
+RuntimeObject* find_object(const GUID& class_id) {
+    for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
+                             &package_object(), &game_object()})
+        if (class_id == *o->class_id) return o;
+    for (RuntimeObject* const* o = measured_objects(); *o; ++o)
+        if (class_id == *(*o)->class_id) return *o;
+    return nullptr;
+}
+
+// QueryApiImpl's answer for a served class: true with *hr set (and *out on success) when this file or one of the
+// other xgameruntime_*.cpp files serves the class, false when none does.
+bool query_served(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr) {
+    if (RuntimeObject* o = find_object(class_id)) {
+        *hr = object_query_interface(o, interface_id, out);
+        return true;
+    }
+    return rt::shims::xgameruntime_user_query(class_id, interface_id, out, hr) ||       // xgameruntime_user.cpp
+           rt::shims::xgameruntime_gamesave_query(class_id, interface_id, out, hr) ||   // xgameruntime_gamesave.cpp
+           rt::shims::xgameruntime_store_query(class_id, interface_id, out, hr) ||      // xgameruntime_store.cpp
+           rt::shims::xgameruntime_offline_query(class_id, interface_id, out, hr);      // xgameruntime_offline.cpp
+}
+
+// Whether QueryApiImpl serves the class, whichever file serves it (the reference taken to find out is released).
+bool class_served(const GUID& class_id) {
+    void* obj = nullptr;
+    HRESULT hr = S_OK;
+    if (!query_served(class_id, kIUnknown, &obj, &hr)) return false;
+    if (obj) (*static_cast<ULONG(STDMETHODCALLTYPE* const* const*)(void*)>(obj))[2](obj);   // Release
+    return true;
+}
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
-                                 &package_object(), &game_object()})
-            if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
         HRESULT hr = S_OK;
-        if (rt::shims::xgameruntime_user_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_user.cpp
-        if (rt::shims::xgameruntime_gamesave_query(*class_id, interface_id, out, &hr))   // xgameruntime_gamesave.cpp
-            return hr;
-        if (rt::shims::xgameruntime_store_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_store.cpp
-        if (rt::shims::xgameruntime_offline_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_offline.cpp
+        if (query_served(*class_id, interface_id, out, &hr)) return hr;
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
@@ -834,8 +866,7 @@ static std::unordered_map<uint64_t, std::string> s_active_mounts;
 // Resolves the installation path for a specific content package identifier.
 // GDK specifies that XPackageMount is only for content packages; mounting the main game returns E_ACCESSDENIED.
 // Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
-static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
-    if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
+static std::string resolve_package_path(const char* packageIdentifier, HRESULT& result) {
 
     // Check against configured process/game package identifier; mounting the game itself is denied
     char game_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
@@ -843,14 +874,25 @@ static HRESULT resolve_package_path(const char* packageIdentifier, char* out, si
     const char* process_id = (n > 0 && n < sizeof(game_id)) ? game_id : kDefaultPackageIdentifier;
 
     if (std::strcmp(packageIdentifier, process_id) == 0) {
-        return E_ACCESSDENIED;
+        result = E_ACCESSDENIED;
+        return {};
     }
 
     // Check optional installed content packages mapping: "id1=path1;id2=path2"
-    char mapping[1024] = {};
-    const DWORD map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
-    if (map_len > 0 && map_len < sizeof(mapping)) {
-        char* token = mapping;
+    DWORD capacity = GetEnvironmentVariableW(L"LEONIDA_CONTENT_PACKAGES", nullptr, 0);
+    std::wstring wide_mapping;
+    DWORD map_len = 0;
+    while (capacity > 0) {
+        wide_mapping.resize(capacity);
+        map_len = GetEnvironmentVariableW(L"LEONIDA_CONTENT_PACKAGES", wide_mapping.data(), capacity);
+        if (map_len < capacity) break;
+        capacity = map_len;
+    }
+    if (map_len > 0 && map_len < capacity) {
+        // The GDK returns UTF-8 bytes even when Windows uses a legacy ANSI code page.
+        wide_mapping.resize(map_len);
+        std::string mapping = utf8_of(wide_mapping);
+        char* token = mapping.data();
         while (token && *token) {
             char* sep = std::strchr(token, ';');
             if (sep) *sep = '\0';
@@ -858,18 +900,16 @@ static HRESULT resolve_package_path(const char* packageIdentifier, char* out, si
             if (eq) {
                 *eq = '\0';
                 if (std::strcmp(token, packageIdentifier) == 0) {
-                    const char* val = eq + 1;
-                    const size_t vlen = std::strlen(val);
-                    if (vlen + 1 > out_cap) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-                    std::memcpy(out, val, vlen + 1);
-                    return S_OK;
+                    result = S_OK;
+                    return eq + 1;
                 }
             }
             token = sep ? sep + 1 : nullptr;
         }
     }
 
-    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    result = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    return {};
 }
 
 // HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
@@ -879,14 +919,14 @@ HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHand
     if (!packageIdentifier || !mount) return E_INVALIDARG;
     mount->handle = 0;
 
-    char buf[MAX_PATH] = {};
-    const HRESULT hr = resolve_package_path(packageIdentifier, buf, sizeof(buf));
+    HRESULT hr;
+    const std::string path = resolve_package_path(packageIdentifier, hr);
     if (FAILED(hr)) return hr;
 
     const uint64_t id = s_next_mount_id.fetch_add(1);
     {
         std::lock_guard lock(s_mount_mutex);
-        s_active_mounts[id] = buf;
+        s_active_mounts[id] = path;
     }
     mount->handle = id;
     return S_OK;
@@ -972,8 +1012,6 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
     return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
 }
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
-// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
-// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
 // The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
 // there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
 // intact.
@@ -987,19 +1025,47 @@ std::string package_config() {
     return std::string{std::istreambuf_iterator<char>(f), {}};
 }
 
+// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
+// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
+// A <Resource> inside an XML comment is not declared (Microsoft's config template ships commented-out entries), XML
+// allows whitespace around an attribute's '=', and only an attribute named exactly Language on an element named
+// exactly Resource counts.
 std::vector<std::string> package_locales() {
     std::vector<std::string> out;
-    const std::string xml = package_config();
-    if (xml.empty()) return out;
+    const std::string raw = package_config();
+    if (raw.empty()) return out;
+    std::string xml;   // the config without its comments; an unterminated comment runs to the end of the file
+    xml.reserve(raw.size());
+    for (size_t at = 0; at < raw.size();) {
+        const size_t open = raw.find("<!--", at);
+        xml.append(raw, at, open == std::string::npos ? std::string::npos : open - at);
+        if (open == std::string::npos) break;
+        const size_t close = raw.find("-->", open + 4);
+        if (close == std::string::npos) break;
+        at = close + 3;
+    }
+    const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const auto skip_space = [&](size_t p) {
+        while (p < xml.size() && space(xml[p])) ++p;
+        return p;
+    };
     for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
-        if (xml.compare(at, 10, "<Resources") == 0) continue;
-        const size_t end = xml.find('>', at);
-        const size_t key = xml.find("Language=", at);
-        if (end == std::string::npos || key == std::string::npos || key + 10 > end) continue;
-        const char quote = xml[key + 9];
-        const size_t close = xml.find(quote, key + 10);
-        if ((quote == '"' || quote == '\'') && close != std::string::npos && close < end)
-            out.push_back(xml.substr(key + 10, close - key - 10));
+        size_t p = at + 9;
+        if (p < xml.size() && !space(xml[p]) && xml[p] != '/' && xml[p] != '>') continue;   // <Resources>, ...
+        // The attributes, name = "value" or name = 'value', up to the tag's end; a malformed one ends the tag.
+        for (p = skip_space(p); p < xml.size() && xml[p] != '>' && xml[p] != '/'; p = skip_space(p)) {
+            const size_t name = p;
+            while (p < xml.size() && !space(xml[p]) && xml[p] != '=' && xml[p] != '>' && xml[p] != '/') ++p;
+            const size_t name_end = p;
+            p = skip_space(p);
+            if (p >= xml.size() || xml[p] != '=') break;
+            p = skip_space(p + 1);
+            if (p >= xml.size() || (xml[p] != '"' && xml[p] != '\'')) break;
+            const size_t close = xml.find(xml[p], p + 1);
+            if (close == std::string::npos) break;
+            if (xml.compare(name, name_end - name, "Language") == 0) out.push_back(xml.substr(p + 1, close - p - 1));
+            p = close + 1;
+        }
     }
     return out;
 }
@@ -1011,7 +1077,10 @@ std::vector<std::string> package_locales() {
 HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
     if (!locale || !size) return E_INVALIDARG;
     const std::vector<std::string> declared = package_locales();
-    if (declared.empty()) return S_OK;
+    if (declared.empty()) {
+        locale[0] = '\0';
+        return S_OK;
+    }
     wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
     char user[LOCALE_NAME_MAX_LENGTH * 4] = "";
     if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)
@@ -1178,6 +1247,113 @@ RuntimeObject& game_object() {
     return object;
 }
 
+// ---- XGameRuntimeFeatureImpl, XSystemAnalyticsImpl ----
+//
+// Measured with tools/gdk_runtime_calls.py, which finds xgameruntime.lib's thunks in an image's code without running
+// it: for each class, the interface id the thunks ask QueryApiImpl for, the slots they call and the number of
+// arguments each passes after `this`. On the package's libHttpClient.GDK.dll every slot below is the function at that
+// position of the interface's "Layout" list in xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), and the measured
+// argument count is the documented one. Signatures and semantics are Microsoft's public GDK reference pages,
+// learn.microsoft.com/gaming/gdk/docs/reference/system/<family>/functions/<name>, cited per function as
+// <family>/<name>.
+// The thunks are in libHttpClient.GDK.dll but nothing there calls them; a title linked with the same xgameruntime.lib
+// reaches these classes through the same thunks. docs/runtime_imports.md has the table.
+
+#define VT(fn) reinterpret_cast<const void*>(&fn)
+
+// XSystemAnalyticsImpl (IXSystemAnalyticsImpl, whose id is the class id): slot 3 is
+//   XSystemAnalyticsInfo XSystemGetAnalyticsInfo()   (xsystem/xsystemgetanalyticsinfo)
+// The one argument measured after `this` is where the result goes: a member function returning a struct takes its
+// address after `this` and returns it (MSVC x64), and the thunk copies the struct out of the returned pointer. The
+// answer is the named export's.
+constexpr GUID kSystemAnalyticsClass = {0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}};
+
+XSystemAnalyticsInfo* STDMETHODCALLTYPE system_analytics_info(void*, XSystemAnalyticsInfo* result) {
+    if (result) *result = XSystemGetAnalyticsInfo();
+    return result;
+}
+
+const void* const kSystemAnalyticsVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(system_analytics_info),  // 3
+};
+
+// XGameRuntimeFeatureImpl (IXGameRuntimeFeatureImpl, whose id is the class id): slot 3 is
+//   bool XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature)
+// (xgameruntimefeature/xgameruntimeisfeatureavailable), measured with one 32-bit argument and a byte result.
+// XGameRuntimeFeature : uint32_t has the values of Microsoft's enum page, XAccessibility = 0 to XGameStreaming = 21.
+// Offline a feature is available when both hold:
+//   - QueryApiImpl serves the class its functions go through (xgameruntime-docs' layouts), from this file or another
+//     xgameruntime_*.cpp, so a call can reach it; the answer follows each class as it is served;
+//   - Microsoft documents it for Windows: an offline PC lacks what is documented only for the consoles (XDisplay:
+//     xdisplay/xdisplaytryenablehdrmode lists only the Xbox consoles as supported platforms).
+// Values past the enum are false.
+constexpr GUID kGameRuntimeFeatureClass = {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
+
+// The classes no object in this file stands for; the other files serve some of them. Named ...ClassId, not ...Class,
+// because tools/gdk_runtime_calls.py counts every `constexpr GUID k...Class` in these files as a served class.
+constexpr GUID kAccessibilityClassId = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kAppCaptureClassId = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kDisplayClassId = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+constexpr GUID kGameEventClassId = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
+constexpr GUID kGameInviteClassId = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
+constexpr GUID kGameSaveClassId = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+constexpr GUID kGameStreamingClassId = {0x0a2192aa, 0xb2d5, 0x4d58, {0x83, 0xbe, 0x38, 0x3b, 0x6d, 0x80, 0x79, 0x9e}};
+constexpr GUID kGameUiClassId = {0xdfcd4649, 0x4ff8, 0x4043, {0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0}};
+constexpr GUID kLauncherClassId = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+constexpr GUID kStoreClassId = {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+constexpr GUID kUserClassId = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+
+struct RuntimeFeature {
+    const GUID* class_id;  // the class the feature's functions go through
+    bool console_only;     // documented for the Xbox consoles only
+};
+const RuntimeFeature kRuntimeFeatures[] = {
+    {&kAccessibilityClassId, false},    // 0  XAccessibility
+    {&kAppCaptureClassId, false},       // 1  XAppCapture
+    {&kThreadingClass, false},          // 2  XAsync
+    {&kThreadingClass, false},          // 3  XAsyncProvider
+    {&kDisplayClassId, true},           // 4  XDisplay
+    {&kGameClass, false},               // 5  XGame
+    {&kGameInviteClassId, false},       // 6  XGameInvite
+    {&kGameSaveClassId, false},         // 7  XGameSave
+    {&kGameUiClassId, false},           // 8  XGameUI
+    {&kLauncherClassId, false},         // 9  XLauncher
+    {&kNetworkingClass, false},         // 10 XNetworking
+    {&kPackageClass, false},            // 11 XPackage
+    {&kPersistentStorageClass, false},  // 12 XPersistentLocalStorage
+    {&kAccessibilityClassId, false},    // 13 XSpeechSynthesizer (IXAccessibilityImpl holds its functions)
+    {&kStoreClassId, false},            // 14 XStore
+    {&kSystemClass, false},             // 15 XSystem
+    {&kThreadingClass, false},          // 16 XTaskQueue
+    {&kThreadingClass, false},          // 17 XThread
+    {&kUserClassId, false},             // 18 XUser
+    {&kErrorClass, false},              // 19 XError
+    {&kGameEventClassId, false},        // 20 XGameEvent
+    {&kGameStreamingClassId, false},    // 21 XGameStreaming
+};
+static_assert(std::size(kRuntimeFeatures) == 22, "XGameRuntimeFeature has 22 values");
+
+bool STDMETHODCALLTYPE runtime_is_feature_available(void*, uint32_t feature) {
+    if (feature >= std::size(kRuntimeFeatures)) return false;
+    const RuntimeFeature& f = kRuntimeFeatures[feature];
+    return !f.console_only && class_served(*f.class_id);
+}
+
+const void* const kGameRuntimeFeatureVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(runtime_is_feature_available),  // 3
+};
+#undef VT
+
+RuntimeObject g_game_runtime_feature{kGameRuntimeFeatureVtable, &kGameRuntimeFeatureClass, nullptr};
+RuntimeObject g_system_analytics{kSystemAnalyticsVtable, &kSystemAnalyticsClass, nullptr};
+
+RuntimeObject* const* measured_objects() {
+    static RuntimeObject* const objects[] = {&g_game_runtime_feature, &g_system_analytics, nullptr};
+    return objects;
+}
+
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
 
 }  // namespace
@@ -1189,6 +1365,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},

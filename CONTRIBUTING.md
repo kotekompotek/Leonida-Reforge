@@ -12,17 +12,25 @@ Thanks for helping. A few rules keep the project safe to host:
 
 ## Before you start
 
-Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
-moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull
-requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID in
-your pull request. Found something that needs doing but won't do it yourself? Post `finding: <one line>` there, with
-where it is and why it matters, and it goes on the list for others. When two pull requests overlap anyway, the one
-that lands first is merged and the other is asked to rebase or close. GPU test results go in
-[#166](https://github.com/ItsNotRexed/Leonida/issues/166). Work on the D3D12 → Vulkan layer has its own page,
-[#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical path, who builds what, and which D3D12
-methods are still open.
+Search the [current issues][issues] and [pull requests][pulls] to avoid duplicate work. For substantial changes,
+describe the scope and intended tests in a relevant issue before implementing. Use a draft PR to share early work.
+Link related issues and dependencies in the PR. Numbers from the original repository are historical; qualify
+them with that repository's name or URL rather than treating them as IDs in this repository.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+Keep changes focused and report reproducible commands, results, skipped checks, and relevant versions. For GPU
+reports, include the exact commit, operating system, GPU, driver, and synthetic test output with local paths and
+game information removed. A successful API call, valid SPIR-V, and bit-exact output are different results.
+Separate new measurements from historical reports. See [GOVERNANCE.md](GOVERNANCE.md) for review and merge
+policy, and [SECURITY.md](SECURITY.md) for private reporting instructions.
+Please follow the [code of conduct](CODE_OF_CONDUCT.md). Contributions do not require joining the organization;
+start with a fork and a pull request. See the [contributor access policy](GOVERNANCE.md#contributor-access) for
+the responsibilities of each team.
+
+Only contribute material you are authorized to redistribute. Preserve authorship, copyright and license notices;
+for new third-party material document its source, version and applicable terms in the PR.
+
+[issues]: https://github.com/LeonidaReforge/Leonida/issues
+[pulls]: https://github.com/LeonidaReforge/Leonida/pulls
 
 ## Working on the code
 
@@ -31,6 +39,10 @@ methods are still open.
   encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
   `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
   platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
+- A report writer refuses an output that names one of its inputs or another output, and asks
+  `tools/report_paths.same_report_path(a, b)` rather than deriving the answer again: it resolves both paths,
+  applies the volume's case rules and falls back to `os.path.samefile`, so a new tool reuses one answer
+  instead of a private copy. `tests/test_report_paths.py` covers it.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
@@ -54,5 +66,5 @@ methods are still open.
   A new test gets its expected values in the comment at its top and a check in `check.py`.
   [docs/testing.md](docs/testing.md) covers setup per OS, including native Windows options, and known problems.
 - Say what you tested and on which GPU in the pull request.
-- Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
+- Run the translator tests with `python -I scripts/run_semantic_tests.py tests/semantic` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.

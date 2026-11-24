@@ -16,6 +16,7 @@ Usage:
 
 `--rigs` additionally joins the RBF0 stream with its 64 KiB continuation blocks and writes the rig-set/rig entries
 and plain `SKEL_` bone names to its own JSON. It stops at the next known container signature or a gap.
+Usage: `python -I tools/anim_index.py --help` lists the options.
 """
 import argparse
 import bisect
@@ -389,7 +390,11 @@ def scan_rpf(path, start=None, limit=None, progress=None):
         raise ValueError("empty file")
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         size = len(m)
-        first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
+        if size < 8:
+            raise ValueError("truncated RPF9 header")
+        if m[:4] not in (b"9FPR", b"RPF9"):
+            raise ValueError("not an RPF9 archive")
+        first = struct.unpack_from("<I", m, 4)[0]
         pos = start if start is not None else first
         if not 0 <= pos <= size:
             raise ValueError("start offset is outside the archive")

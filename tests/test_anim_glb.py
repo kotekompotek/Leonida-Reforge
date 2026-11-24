@@ -615,6 +615,26 @@ class ExportTest(unittest.TestCase):
         (gltf, _binary), _report = self.export("--no-root-motion")
         self.assertNotIn("mover", [n.get("name") for n in gltf["nodes"]])
 
+    def test_clip_selection_must_have_an_animation_export(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "report.json")
+        common = ["--skeleton", hex(self.offsets[0]), "--report", report]
+        for selector in (["--clip", "walk"], ["--dictionary", "0"]):
+            for mode, args in (("--anim", [out, "--part", hex(self.offsets[1])]),
+                               ("--coverage", ["--coverage", "--anim", self.anim])):
+                with self.subTest(selector=selector, mode=mode):
+                    result = self.run_tool(self.packs, *args, *common, *selector)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(selector[0], result.stderr.splitlines()[-1])
+                    self.assertIn(mode, result.stderr.splitlines()[-1])
+                    self.assertFalse(os.path.exists(out))
+                    self.assertFalse(os.path.exists(report))
+
+        # The same authored part is still a valid static export without selectors.
+        result = self.run_tool(self.packs, out, "--part", hex(self.offsets[1]), *common)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("animations", read_glb(out)[0])
+
     def test_coverage_counts_bone_tracks(self):
         report = os.path.join(self.tmp.name, "coverage.json")
         r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
@@ -624,6 +644,17 @@ class ExportTest(unittest.TestCase):
             counts = json.load(f)["counts"]
         self.assertEqual((counts["dictionaries"], counts["bone_tracks"], counts["bone_tracks_in_skeleton"],
                           counts["dictionaries_all_bones_in_skeleton"]), (1, 3, 3, 1))
+
+    def test_a_jobs_count_below_one_is_refused(self):
+        # coverage() used max(1, jobs), so 0 and negatives ran one serial worker and still exited 0.
+        report = os.path.join(self.tmp.name, "coverage.json")
+        for jobs in ("0", "-4"):
+            r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
+                              "--report", report, "--jobs", jobs)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--jobs", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(report), "the run still wrote a report")
 
     def test_a_skeleton_whose_binds_disagree_is_refused(self):
         write_archive(self.packs, [[skeleton_resource(shift_bind=0.3)]])
@@ -664,11 +695,63 @@ class ExportTest(unittest.TestCase):
         self.assertIn(report, r.stderr)
         self.assertEqual(r.stdout, "")
 
+    def test_failed_report_write_preserves_existing_report(self):
+        import contextlib
+        import io
+
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "kept_report.json")
+        old_text = '{"previous": true}\n'
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_text)
+
+        real_named_temp = tempfile.NamedTemporaryFile
+        real_replace = os.replace
+
+        def failing_temp(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+            if kwargs.get("prefix") == ".anim_glb-":
+                def fail_write(data):
+                    handle.file.write(data[:4])
+                    raise OSError(28, "No space left on device")
+
+                handle.write = fail_write
+            return handle
+
+        def failing_replace(src, dst, *args, **kwargs):
+            if dst == report:
+                raise PermissionError(13, "Permission denied")
+            return real_replace(src, dst, *args, **kwargs)
+
+        for label, patch_ctx in (
+            ("write", patch.object(anim_glb.tempfile, "NamedTemporaryFile", side_effect=failing_temp)),
+            ("replace", patch.object(anim_glb.os, "replace", side_effect=failing_replace)),
+        ):
+            with self.subTest(label=label), patch_ctx:
+                err, so = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(so):
+                    rc = anim_glb.main([self.packs, out, "--skeleton", hex(self.offsets[0]),
+                                        "--part", hex(self.offsets[1]), "--report", report])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot write report", err.getvalue())
+                self.assertEqual(so.getvalue(), "")
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), old_text)
+                self.assertFalse([n for n in os.listdir(self.tmp.name) if n.startswith(".anim_glb-")])
+
     def test_a_bad_offset_is_one_error_line(self):
         r = self.run_tool(self.packs, os.path.join(self.tmp.name, "x.glb"), "--skeleton", "0x20", "--part", "0x20")
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+
+    def test_a_missing_archive_prints_its_path_without_repr_escaping(self):
+        missing = os.path.join(self.tmp.name, "missing", "packs.rpf")
+        r = self.run_tool(missing, os.path.join(self.tmp.name, "x.glb"),
+                          "--skeleton", "0x1000", "--part", "0x1000")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
+        self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":

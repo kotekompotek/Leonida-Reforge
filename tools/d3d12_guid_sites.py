@@ -27,6 +27,7 @@ Usage:
                                         [--known NAME=GUID ...] [--json OUT]
 
 Without --header it takes d3d12.h from the newest Windows SDK under "Windows Kits\\10\\Include".
+The --json output must name a file separate from the images and the header.
 """
 from __future__ import annotations
 
@@ -38,6 +39,9 @@ import re
 import struct
 import sys
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 MIDL = re.compile(r'MIDL_INTERFACE\("([0-9a-fA-F-]{36})"\)\s*\n\s*(ID3D12\w+)')
 
@@ -76,11 +80,22 @@ class Image:
             raise ValueError("not a PE image")
         sections, opt_size = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
         opt = pe + 24
-        self.pe32plus = struct.unpack_from("<H", data, opt)[0] == 0x20B
+        if opt_size < 2 or opt + opt_size > len(data):
+            raise ValueError("optional header too small or truncated")
+        opt_magic = struct.unpack_from("<H", data, opt)[0]
+        if opt_magic not in (0x10B, 0x20B):
+            raise ValueError(f"unsupported PE optional header magic 0x{opt_magic:x}")
+        self.pe32plus = opt_magic == 0x20B
+        dirs_rel = 112 if self.pe32plus else 96
+        if opt_size < dirs_rel:
+            raise ValueError("optional header too small for data directory count")
         base_off = 24 if self.pe32plus else 28  # PE32+ ImageBase at opt+24, PE32 at opt+28
         self.image_base = struct.unpack_from("<Q" if self.pe32plus else "<I", data, opt + base_off)[0]
-        dirs = opt + (112 if self.pe32plus else 96)
-        self.dirs = [struct.unpack_from("<II", data, dirs + 8 * i) for i in range(16)]
+        dirs = opt + dirs_rel
+        num_dirs = struct.unpack_from("<I", data, dirs - 4)[0]
+        readable_dirs = min(num_dirs, (opt_size - dirs_rel) // 8, 16)
+        self.dirs = [struct.unpack_from("<II", data, dirs + 8 * i) for i in range(readable_dirs)]
+        self.dirs.extend((0, 0) for _ in range(16 - readable_dirs))
         self.sections = []
         table = opt + opt_size
         for i in range(sections):
@@ -349,10 +364,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
 
-    known: dict[str, uuid.UUID] = {}
     header = args.header
     if header is None:
         header = default_header()
+    if args.json:
+        for source in (*args.images, header):
+            if source and same_report_path(args.json, source):
+                ap.error(f"--json {args.json} would overwrite the input {source}")
+
+    known: dict[str, uuid.UUID] = {}
     if header and os.path.isfile(header):
         known.update(read_iids(header))
     for pair in args.known:
@@ -366,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
 
     results = []
     for path in args.images:
+        if not os.path.isfile(path):
+            print(f"ERROR: cannot read {path}: no such file", file=sys.stderr)
+            return 2
         try:
             r = scan(path, known)
         except (ValueError, struct.error) as e:

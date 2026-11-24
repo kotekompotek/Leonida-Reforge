@@ -7,6 +7,7 @@
 Each run renders offscreen in a fresh process and write overlay. Without --out the runs go to a temporary folder that is removed
 afterwards. The summary is printed first, and on failure the last run's log tails are printed too. Audio stays offline
 unless --play-audio sets LEONIDA_SCENE_AUDIO=winmm. The guest then plays the pulse synchronously with PlaySoundW.
+Run records distinguish a child exit, a deadline expiry and a launch failure.
 --negative-controls also runs a corrupted scene.bin and a corrupted checkpoint.bin, and each one must exit with 1.
 Exit code 0 means every check passed, 1 means a check failed and 2 means bad arguments.
 """
@@ -186,7 +187,7 @@ class Session:
 
     def run(self, name: str, mode: str, package: Path, overlay: Path) -> tuple[int, list[bytes], bytes]:
         a, wine = self.args, bool(self.args.wine)
-        cmd = ([a.wine] if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
+        cmd = ([a.wine, *a.wine_arg] if wine else []) + [str(a.loader), "--run", guest_path(a.guest, wine), "--game-dir",
                                             guest_path(package, wine), "--overlay", guest_path(overlay, wine),
                                             "--", guest_path(a.shaders, wine)]
         env_set = {"LEONIDA_SCENE_MODE": mode,
@@ -196,18 +197,28 @@ class Session:
         env = dict(os.environ, **env_set)
         self.last = [self.logs / f"{name}.stdout.log", self.logs / f"{name}.stderr.log"]
         start = time.monotonic()
+        rc, launch_error = None, None
         with self.last[0].open("xb") as so, self.last[1].open("xb") as se:
             try:
                 rc = subprocess.run(cmd, cwd=overlay, env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se,
                                     timeout=TIMEOUT).returncode
             except subprocess.TimeoutExpired:
-                rc = None
+                outcome = "timed_out"
+            except OSError as e:
+                outcome = "launch_failed"
+                launch_error = str(e)
+            else:
+                outcome = "exited"
         stdout, stderr = (p.read_bytes() for p in self.last)
-        rec = {"cmd": cmd, "cwd": str(overlay), "env": env_set, "returncode": rc, "timeout_s": TIMEOUT,
+        rec = {"cmd": cmd, "cwd": str(overlay), "env": env_set, "outcome": outcome, "returncode": rc, "timeout_s": TIMEOUT,
                "seconds": round(time.monotonic() - start, 3), "stdout_sha256": sha256(stdout),
                "stderr_sha256": sha256(stderr)}
+        if launch_error is not None:
+            rec["launch_error"] = launch_error
         write_new(self.logs / f"{name}.json", json.dumps(rec, indent=2).encode())
         self.runs[name] = rec
+        if launch_error is not None:
+            raise Fail(f"{name}: could not launch {cmd[0]}: {launch_error}")
         check(rc is not None, f"{name}: timed out after {TIMEOUT}s")
         return rc, [line.rstrip(b"\r") for line in stdout.splitlines()], stdout + stderr
 
@@ -245,7 +256,11 @@ def negative_controls(session: Session, out: Path) -> dict:
 
 
 def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
-    out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
+    try:
+        out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
+    except OSError as exc:
+        print(f"error: could not create output directory {out}: {exc}", file=sys.stderr)
+        return 1
     session = Session(args, out)
     report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": args.wine, "temporary": temporary,
                     "audio_mode": "winmm" if args.play_audio else "offline", "report": str(out / "report.json")}
@@ -310,9 +325,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shaders", type=Path, required=True, help="shader root containing spirv/")
     ap.add_argument("--out", type=Path, help="new or empty folder (default: a temporary folder, removed afterwards)")
     ap.add_argument("--wine", help="run the loader through this Wine binary")
+    ap.add_argument("--wine-arg", action="append", default=[], help="argument to the Wine launcher (repeatable)")
     ap.add_argument("--play-audio", action="store_true", help="LEONIDA_SCENE_AUDIO=winmm instead of offline")
     ap.add_argument("--negative-controls", action="store_true", help="also run a bad scene.bin and checkpoint")
     args = ap.parse_args()
+    if args.wine_arg and not args.wine:
+        ap.error("--wine-arg requires --wine")
     for name in ("loader", "guest"):
         if not getattr(args, name).is_file():
             ap.error(f"--{name}: no such file")

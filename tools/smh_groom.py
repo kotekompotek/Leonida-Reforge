@@ -200,22 +200,39 @@ def scan_offsets(
     chunk: int = 64 << 20,
 ) -> Iterator[int]:
     """Yield the byte offset of every groom LOD resource in ``src`` (16-aligned zero prefix + zlib page)."""
+    if isinstance(chunk, bool) or chunk <= 0:
+        raise GroomError(f"scan chunk size must be positive, got {chunk}")
+    if isinstance(src, memoryview):
+        if src.nbytes == 0:
+            return
+        if src.c_contiguous and 0 not in src.strides:
+            src = src.cast("B")
+        elif not (src.ndim == 1 and src.itemsize == 1):
+            src = src.tobytes()
     size = len(src)
     stop = size if stop is None else min(stop, size)
-    first = (max(start, 0) // 16) * 16
+    first = (max(start, 0) + 15) & -16
+    overlap = len(PREFIX) - 1
     for base in range(first, stop, chunk):
-        end = min(base + chunk + 17, stop)
+        window_end = min(base + chunk, stop)
+        limit = window_end - base
+        end = min(window_end + overlap, size)
         block = src[base:end]
+        if isinstance(block, memoryview):
+            block = block.tobytes()
         at = -1
         while True:
             at = block.find(PREFIX, at + 1)
-            if at < 0 or at >= chunk:
+            if at < 0 or at >= limit:
                 break
-            if at & 15:
-                continue
             off = base + at
+            if off & 15:
+                continue
+            comp = src[off + 16:min(off + 16 + 4096, size)]
+            if isinstance(comp, memoryview) and not comp.c_contiguous:
+                comp = comp.tobytes()
             try:
-                head = zlib.decompressobj().decompress(src[off + 16:min(off + 16 + 4096, size)], 4096)
+                head = zlib.decompressobj().decompress(comp, 4096)
             except zlib.error:
                 continue
             if system_page_is_groom(head):
@@ -1770,6 +1787,17 @@ def _parse_int(text: str) -> int:
     return value
 
 
+def _parse_limit(text: str) -> int:
+    """--limit: at least 1; 0 stopped before the first target, so census read as an empty corpus."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def _parse_classes(text: str) -> tuple[int, ...]:
     if not text.strip():
         return ()
@@ -1852,7 +1880,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cen = sub.add_parser("census", help="Scan RPF9 archives, carved .smh files or directories for aggregate counts.")
     p_cen.add_argument("paths", nargs="+", help="One or more archive files, .smh files or directories")
     p_cen.add_argument("--json", action="store_true", help="Emit JSON report")
-    p_cen.add_argument("--limit", type=_parse_int, default=None, help="Stop after N groom LOD resources")
+    p_cen.add_argument("--limit", type=_parse_limit, default=None, help="Stop after N groom LOD resources")
 
     p_glb = sub.add_parser("export-glb", help="Export a groom LOD to binary glTF 2.0 (.glb).")
     p_glb.add_argument("path", help="Path to carved .smh/.bin file or RPF9 archive")

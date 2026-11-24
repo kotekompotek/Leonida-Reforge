@@ -25,6 +25,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+import pool_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
@@ -123,6 +124,14 @@ def _read_field(b: bytes, base: int, member):
     return WI._value(b, base, member)
 
 
+# Bytes read by _read_field and the world_index value decoder for each supported member type.
+FIELD_WIDTHS = {
+    0x01: 1, 0x08: 8, 0x10: 1, 0x11: 1, 0x12: 2, 0x13: 2,
+    0x14: 4, 0x15: 4, 0x21: 4, 0x32: 12, 0x33: 12, 0x34: 16, 0x35: 48,
+    0x4A: 4, 0x4F: 8, 0x60: 1, 0x62: 4,
+}
+
+
 def parse_fog_volumes(b: bytes, *, include_digest: bool = False) -> list[dict]:
     """Decode all CScatteringTransmittance__FogVolume instances in a 0x7a resource."""
     structs, blocks = parse_schema(b)
@@ -131,13 +140,20 @@ def parse_fog_volumes(b: bytes, *, include_digest: bool = False) -> list[dict]:
     vsz, vmems = structs[STRUCT_VOLUME]
     if not vsz:
         return []
+    fields = {}
+    for name, field_hash in FIELDS.items():
+        member = vmems.get(field_hash)
+        if member is not None:
+            width = FIELD_WIDTHS.get(member[1])
+            if width is not None and member[0] + width <= vsz:
+                fields[name] = member
     out: list[dict] = []
     for bsh, bsz, boff in blocks:
         if bsh != STRUCT_VOLUME or boff is None or bsz % vsz or boff + bsz > len(b):
             continue
         for k in range(bsz // vsz):
             base = boff + k * vsz
-            row = {name: _read_field(b, base, vmems.get(h)) for name, h in FIELDS.items()}
+            row = {name: _read_field(b, base, member) for name, member in fields.items()}
             cleaned = {k_: v for k_, v in row.items() if v is not None}
             if include_digest:
                 cleaned["_sha256"] = hashlib.sha256(b[base:base + vsz]).digest()
@@ -209,7 +225,7 @@ def _scan_rpf_offsets(path: str, jobs: int = 1) -> tuple[list[int], int, int]:
     size = os.path.getsize(path)
     if size < 16:
         return [], 0, 0
-    workers = max(1, jobs)
+    workers = pool_workers.process_workers(max(1, jobs))
     chunk_sz = max(4 * 1024 * 1024, min(64 * 1024 * 1024, (size + workers - 1) // workers))
     ranges = [(path, s, min(size, s + chunk_sz)) for s in range(0, size, chunk_sz)]
     offs: list[int] = []
@@ -411,8 +427,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, carved 0x7a file, or folder of carved files")
     ap.add_argument("--out", help="optional JSON summary output path")
-    ap.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 4),
-                    help="worker processes for RPF9 scanning")
+    ap.add_argument("--jobs", type=WC.job_count, default=min(16, os.cpu_count() or 4),
+                    help="worker processes for RPF9 scanning (at least 1)")
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error(f"no such file or folder: {a.path}")
@@ -422,7 +438,7 @@ def main(argv=None) -> int:
         if os.path.isfile(a.path) and same_report_path(a.path, a.out):
             ap.error(f"--out would overwrite input: {a.out}")
     try:
-        doc = summarize(a.path, jobs=max(1, a.jobs))
+        doc = summarize(a.path, jobs=a.jobs)
         if a.out:
             _write_json_atomic(a.out, doc)
     except OSError as exc:

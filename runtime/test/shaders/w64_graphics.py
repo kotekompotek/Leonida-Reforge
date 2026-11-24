@@ -14,9 +14,9 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
 
 A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
 checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
-second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-lane run of a device that can require
-it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
-files (equal for A and B, different for C).
+second device stand in for the missing size: W64G_SAVE_REF=<dir> stores the 64-lane run after its available checks
+pass, including on devices with 64 as their only size (AMD GCN). W64G_REF=<dir> compares every run of the other
+device with those files (equal for A and B, different for C).
 
 A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
 A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
@@ -230,12 +230,19 @@ def _wave_size(tools, spirv, stage, size, tmp):
     probe is 32..63 in a wave64 and below 32 in a wave32. Size 32 also needs size 64 to work, so the draws differ."""
     if (stage, size) not in _applied:
         def top(s):
-            words = _draw_heap(tools, spirv, PROBES[stage], s, tmp)[0]
-            return None if words is None else max(w[0] for w in words)
-        lane64, lane32 = top(64), top(32)
+            words, problem = _draw_heap(tools, spirv, PROBES[stage], s, tmp)
+            if words is None and not problem.startswith("unsupported"):
+                return None, f"{s}-wide {stage} subgroup probe: {problem}"
+            return (None if words is None else max(w[0] for w in words)), None
+        lane64, problem = top(64)
+        if problem:
+            return False, problem
+        lane32, problem = top(32)
+        if problem:
+            return False, problem
         _applied[stage, 64] = lane64 is not None and 32 <= lane64 < 64
         _applied[stage, 32] = _applied[stage, 64] and lane32 is not None and lane32 < 32
-    return _applied[stage, size]
+    return _applied[stage, size], None
 
 
 def _draw_heap(tools, spirv, name, size, tmp):
@@ -294,7 +301,12 @@ def draw(tools, spirv, name, size, tmp):
         words, heap = _draw_heap(tools, spirv, name, size, tmp)
         if words is None:
             return None, heap, None
-        return words, heap, _wave_size(tools, spirv, name[:2], size, tmp) if size else None
+        if size:
+            applied, problem = _wave_size(tools, spirv, name[:2], size, tmp)
+            if problem:
+                return None, problem, None
+            return words, heap, applied
+        return words, heap, None
     env = dict(os.environ, **extra)
     env.pop("VKH_SUBGROUP_SIZE", None)
     if size:
@@ -399,9 +411,6 @@ def check(tools, spirv, name):
             if live is not None and live < need:
                 return Skip(f"SKIP (the fragment stage has {live} live lanes per subgroup here, measured with "
                             f"ps_live_width; this fixture needs {need})")
-        if save and 64 in runs:
-            Path(save).mkdir(parents=True, exist_ok=True)
-            (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
         if tier in ("A", "B"):
             for size, (words, heap) in runs.items():
                 if size is None and len(runs) > 1:
@@ -433,6 +442,10 @@ def check(tools, spirv, name):
                     compared = True
                 elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None) != comparable(name, words, None):
                     return "the run differs from the 64-lane reference"
+        # Save after all available checks. A 64-only device can still supply a tier C reference for another device.
+        if save and 64 in runs:
+            Path(save).mkdir(parents=True, exist_ok=True)
+            (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
         if tier == "C" and not compared:
             return Skip("SKIP (tier C needs a device that can require both 64 and 32, or W64G_REF)")
     return ""

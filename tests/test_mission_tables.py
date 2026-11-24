@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "mission_tables.py")
@@ -412,6 +413,52 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(completed.stdout.count(" records="), 2)
             self.assertIn("2 files,", completed.stdout)
+
+    def test_a_single_file_without_the_magic_is_refused(self):
+        # A lone argument is a PSIN file; a folder is where the bare carved .bin streams live. Naming a file
+        # that is neither used to end in "1 files, 0 records" and exit 0, so a wrong path looked like a run.
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "not-a-container.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("not a PSIN container", completed.stderr)
+            self.assertEqual(completed.stdout, "")
+
+    def test_a_folder_still_scans_a_stream_without_the_magic(self):
+        # Negative control: the same bytes in a folder are a carved stream and are still counted.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "bare.bin"), "wb") as handle:
+                handle.write(b"\x01" * 64)
+            completed = subprocess.run([sys.executable, "-I", TOOL, folder], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("1 files, 0 records", completed.stdout)
+            self.assertIn("skipped bytes 64", completed.stdout)
+
+
+class TestWriteJson(unittest.TestCase):
+    def test_failed_replace_preserves_previous_report_and_cleans_temp_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, "report.json")
+            previous = '{"previous": true}\n'
+            with open(report, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(previous)
+            with mock.patch.object(M, "replace_retry", side_effect=PermissionError(13, "locked")):
+                with self.assertRaises(PermissionError):
+                    M.write_json(report, {"updated": True})
+            with open(report, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), previous)
+            self.assertEqual(os.listdir(folder), ["report.json"])
+
+    def test_successful_write_produces_valid_json_and_cleans_temp_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            report = os.path.join(folder, "report.json")
+            payload = {"files": [], "summary": {"files": 0, "records": 0}}
+            M.write_json(report, payload)
+            with open(report, "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), payload)
+            self.assertEqual(os.listdir(folder), ["report.json"])
 
 
 if __name__ == "__main__":

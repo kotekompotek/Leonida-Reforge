@@ -50,8 +50,8 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 - [ffmpeg](https://ffmpeg.org/download.html) w `PATH` *(opcjonalnie: dekoduje strumienie XMA2 i jest wymagany przy
   `--wav`)*.
 
-**Mało miejsca na dysku:** około 350 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
-`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~300 GB) służy tylko narzędziom do zasobów,
+**Mało miejsca na dysku:** około 400 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
+`--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~370 GB) służy tylko narzędziom do zasobów,
 a `--wav` dodaje kilkakrotność rozmiaru Ogg Opus. `--work` i `--out` mogą leżeć na innym dysku; paczka na dysku
 tylko do odczytu wymaga `--overlay` (opcja `gta6rt`) na dysku zapisywalnym. Nie usuwaj plików `.s` z
 `work/shaders/dxbc/disasm`: skasowanie ich z pozostawieniem folderu sprawia, że etap wygląda na ukończony z zerem
@@ -66,7 +66,7 @@ Portu nie pobiera się gotowego. Buduje się go na Twoim komputerze z Twojej kop
 1. Zainstaluj wymagania powyżej.
 2. Pobierz projekt **razem z submodułem**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
    „Download ZIP” z GitHuba pomija `third_party/rpf9-explorer`. Build pobierze go sam, jeśli masz `git`, a w
    przeciwnym razie powie, co zrobić.
@@ -118,7 +118,7 @@ procesora (można to zmienić przez `--jobs`).
   `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (wlicza przesunięcia `image_sample*_o` do
   współrzędnej, dla urządzeń bez `VK_KHR_maintenance8`) i `--mesh-compute` (shadery mesh jako compute, dla urządzeń
   bez `VK_EXT_mesh_shader`). Każda jest opisana w [`docs/design.md`](../../design.md).
-- **`--work`**: najlepiej wskazać dysk z co najmniej 350 GB wolnego miejsca; do samego uruchomienia wystarczy około
+- **`--work`**: najlepiej wskazać dysk z co najmniej 400 GB wolnego miejsca; do samego uruchomienia wystarczy około
   30 GB (zobacz „Mało miejsca na dysku” powyżej).
 - **`--wav`**: domyślnie wyłączone, bo 16-bitowy PCM WAV jest kilkakrotnie większy od Ogg Opus. Dekoduje przepakowane
   strumienie Ogg Opus do `work\assets\audio\wav` po etapie banków audio; istniejące pliki WAV są pomijane przy
@@ -156,19 +156,7 @@ albo tłumaczenie z zachowaniem wyodrębnionych wejść shaderów.
 
 ## Jak pomóc i uruchomić testy GPU
 
-1. Przejrzyj otwarte PR-y i [issue koordynacyjne][coord], żeby nie dublować pracy, i zarezerwuj zadanie **przed**
-   otwarciem PR-a: wpisem `claiming: <ID>` albo jednym zdaniem opisu, jeśli zadanie nie ma jeszcze ID.
-2. Uruchom odpowiednie testy na syntetycznych danych wejściowych. Na przykład weryfikator manifestów testujesz
-   poleceniem `python -I tests/test_manifest_verifier.py` w głównym folderze repozytorium, a suite translatora —
-   `python -m unittest discover -s tests/semantic -v`.
-3. W PR podaj ID zadania, opisz, co przetestowałeś, a jeśli uruchamiałeś testy GPU — podaj kartę i wersję
-   sterownika. Zaznacz, czy korzystałeś z pomocy AI, zgodnie z [`AGENTS.md`](../../../AGENTS.md). Zasady znajdziesz
-   w [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
-
 **Nigdy** nie załączaj do issues ani PR-ów plików gry, wyodrębnionych zasobów ani wygenerowanych shaderów: dziel się
 tylko wynikami (liczby, wyniki testów, klasy błędów).
 
-[Przewodnik po testach GPU](../../testing.md) pokazuje, jak uruchomić testy bez plików gry. Wyniki testów GPU
-publikuj w [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).

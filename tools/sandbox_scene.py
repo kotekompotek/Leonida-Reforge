@@ -13,6 +13,7 @@ Reads the same inputs as ``world_build.py --placements`` (``world_index.py --ent
 Positions stay in model space; a draw's rows are the entity's world transform as three basis rows plus the
 translation, world = x*row0 + y*row1 + z*row2 + row3 (RAGE Z-up). The file holds decoded game data, so it
 stays in the user's work folder. Standard library only.
+Usage: `python -I tools/sandbox_scene.py --help` lists the options.
 """
 import argparse
 import math
@@ -32,16 +33,16 @@ LAYER0_ALBEDO = "346394EA"
 
 
 def select_rows(rows, center, radius, limit):
-    """Rows within radius of center (x, y), nearest first, at most limit."""
+    """Rows within radius of center (x, y), nearest first. A limit of None keeps every match."""
     cx, cy = center
     near = []
     for row in rows:
         dx, dy = row["_pos"][0] - cx, row["_pos"][1] - cy
         d = math.hypot(dx, dy)
         if d <= radius:
-            near.append((d, row))
-    near.sort(key=lambda t: t[0])
-    return [row for _, row in near[:limit]]
+            near.append(row)
+    near.sort(key=lambda row: math.hypot(row["_pos"][0] - cx, row["_pos"][1] - cy))
+    return near if limit is None or limit >= len(near) else near[:limit]
 
 
 def draw_rows(rotation, scale_xy, scale_z, position):
@@ -74,7 +75,8 @@ def texture_bytes(dds_path, max_size):
 
 
 def build(args):
-    rows, counts = world_build.load_placements(args.entities)
+    counts = world_build._placement_counts()
+    rows = world_build.iter_placements(args.entities, counts)
     entries = []
     for path in world_build.discover_model_manifests(args.models):
         data = world_build._load_json_dict(path) or {}
@@ -85,16 +87,21 @@ def build(args):
         for k, v in world_build.index_ttpf_textures(root).items():
             ttpf.setdefault(k, v)
     if args.center is None:   # the 50 m cell holding the most entities that resolve to a model
+        # Only automatic centering needs to visit the placements twice.
+        rows = list(rows)
         cells = {}
         for row in rows:
-            if row["_arch"] in index:
+            model, _ = world_build.resolve_placement(index, row["_arch"], row.get("key"))
+            if model is not None:
                 key = (math.floor(row["_pos"][0] / 50), math.floor(row["_pos"][1] / 50))
                 cells[key] = cells.get(key, 0) + 1
         if not cells:
             raise SystemExit("no entity resolves to an exported model")
         best = max(cells, key=cells.get)
         args.center = [(best[0] + 0.5) * 50, (best[1] + 0.5) * 50]
-    picked = select_rows(rows, args.center, args.radius, args.max_props * 4)
+    # Missing models or empty geometry must not exhaust a positive placement budget.
+    candidate_limit = None if args.max_props > 0 else 0
+    picked = select_rows(rows, args.center, args.radius, candidate_limit)
 
     textures, tex_ids = [], {}
     meshes, mesh_ids = [], {}
@@ -162,13 +169,29 @@ def main(argv=None):
     ap.add_argument("--entities", required=True, help="world_index.py --entities-out file (JSON lines)")
     ap.add_argument("--models", required=True, help="folder holding rpf9dump models manifests")
     ap.add_argument("--textures", action="append", default=[], help="folder holding rpf9dump ttpf manifests (repeatable)")
-    ap.add_argument("--center", type=float, nargs=2, metavar=("X", "Y"), help="RAGE world x y (default: densest 50 m cell)")
+    ap.add_argument("--center", type=float, nargs=2, metavar=("X", "Y"),
+                    help="RAGE world x y (default: densest 50 m cell of resolved model placements)")
     ap.add_argument("--radius", type=float, default=150.0)
     ap.add_argument("--max-props", type=int, default=400, help="entities to place, nearest first (each can be several draws)")
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
+    args = ap.parse_args(argv)
+    if args.center is not None:
+        try:
+            if not all(math.isfinite(v) for v in args.center):
+                raise OverflowError
+            struct.pack("<2f", *args.center)
+        except OverflowError:
+            ap.error("--center coordinates must be finite float32 values")
+    if not math.isfinite(args.radius) or args.radius < 0:
+        ap.error("--radius must be finite and non-negative")
+    if args.max_props < 0:
+        ap.error("--max-props must be non-negative")
+    if os.path.isdir(args.out):
+        print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
+        return 2
     try:
-        stats = build(ap.parse_args(argv))
+        stats = build(args)
     except OSError as e:
         # An unreadable --entities/--models or an unwritable --out used to end in a traceback.
         print(f"ERROR: {e}", file=sys.stderr)

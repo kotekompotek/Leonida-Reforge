@@ -9,6 +9,7 @@ Targets the 3 plain-text payloads (0x640000 VFX_SETTINGS_FILE, 0x64e000 and
 Only payload types, offsets, byte sizes, structural counts and SGD5 match counts
 are printed or written; shader/setting names and raw bytes stay local. Standard
 library only.
+Usage: `python -I tools/gamedata_blobs.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -247,13 +248,39 @@ def _analyze_from_source(source) -> list[dict]:
     return out
 
 
+def check_carve_index(directory: str) -> list[dict]:
+    """Name the index and the bad row of a folder that is not an rpf9_carve.py carve, before the scan.
+
+    DirectorySource reads `index['files']` and each row's `off` and `stored` straight through, so a hand-edited
+    or half-written index fails as `error: 'files'` and names nothing.
+    """
+    index_path = os.path.join(directory, "index.json")
+    if not os.path.isfile(index_path):
+        raise ValueError(f"{directory} is not an rpf9_carve.py folder (no index.json)")
+    try:
+        with open(index_path, encoding="utf-8-sig") as f:
+            index = json.load(f)
+    except OSError as e:
+        raise ValueError(f"cannot read {index_path}: {e.strerror or e}") from e
+    except ValueError as e:
+        raise ValueError(f"{index_path} is not valid JSON: {e}") from e
+    rows = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError(f"{index_path} has no 'files' list")
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict) or "off" not in row or "stored" not in row:
+            raise ValueError(f"{index_path}: row {i} needs an 'off' and a 'stored'")
+    return sorted(rows, key=lambda r: r["off"])
+
+
 def read_payloads(target: str) -> list[dict]:
     """Decode all text and binary payloads from an rpf9_carve.py dir or .rpf archive."""
     if os.path.isdir(target):
+        check_carve_index(target)
         source = gi.DirectorySource(target)
         return _analyze_from_source(source)
     if not os.path.isfile(target):
-        raise FileNotFoundError(target)
+        raise ValueError(f"{target}: no such file or folder")
     source = gi.ArchiveSource(target)
     try:
         return _analyze_from_source(source)
@@ -336,11 +363,14 @@ def main(argv=None) -> int:
     ap.add_argument("--json", help="write aggregate decoded counts to this JSON")
     a = ap.parse_args(argv)
 
+    if not os.path.exists(a.target):
+        print(f"ERROR: cannot read {a.target}: no such file or folder", file=sys.stderr)
+        return 2
     try:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
         if os.path.isdir(a.target):
-            rows = gm._read_index_rows(a.target)
+            rows = check_carve_index(a.target)
             if a.json:
                 check_report_path(a.json, a.target, a.shaders, rows=rows)
         payloads = read_payloads(a.target)

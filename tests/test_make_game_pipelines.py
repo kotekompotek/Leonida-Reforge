@@ -43,7 +43,7 @@ class PipelinesJobsTest(unittest.TestCase):
 
     def main_with(self, *extra):
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
-                "--stages", "pipelines", *extra]
+                "--stages", "pipelines", "--no-tui", *extra]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "preflight"):
@@ -56,7 +56,12 @@ class PipelinesJobsTest(unittest.TestCase):
                                      os.path.join(self.out, "pipeline_cache.bin")])
 
     def test_jobs_on_the_command_line_reach_the_checker(self):
-        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+        with mock.patch("os.cpu_count", return_value=8):
+            self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+
+    def test_jobs_above_cpu_count_are_clamped_for_the_checker(self):
+        with mock.patch("os.cpu_count", return_value=4):
+            self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "4")
 
     def test_windows_reuses_the_checker_from_the_supplied_runtime_build(self):
         supplied = os.path.join(self.root, "unpacked runtime")
@@ -151,6 +156,15 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         return ("--count" in args and args[args.index("--count") + 1] == "1"
                 and "--jobs" in args and args[args.index("--jobs") + 1] == "1")
 
+    def test_bom_marked_index_reaches_the_native_checker_and_preserves_range(self):
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write('{"b_mod": {}, "a_mod": {}, "c_mod": {}}')
+        failed, _ = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][self.calls[0].index("--count") + 1], "3")
+        self.assertEqual(make_game.pipeline_names(self.spirv), ["a_mod", "b_mod", "c_mod"])
+
     def test_a_named_module_is_skipped_and_the_rest_checked(self):
         def script(args, n):
             if self.is_probe(args):
@@ -228,6 +242,88 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), make_game.PIPELINE_CRASH_RETRIES + 1)
         self.assertIn("still crashed after", err.getvalue())
+
+    def test_the_crash_report_names_the_module_and_its_spirv_hash(self):
+        blob = b"\x03\x02\x23\x07"
+        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
+            f.write(blob)
+
+        def script(args, n):
+            if self.is_probe(args):
+                self.inflight_is("b_mod")
+                return ABORT
+            if n == 1:
+                self.inflight_is("b_mod")
+                return ABORT
+            return 1
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(script)
+        self.assertIsNotNone(failed)
+        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc, {"modules": [{"name": "b_mod", "spv_sha256":
+                                            __import__("hashlib").sha256(blob).hexdigest()}]})
+        self.assertIn("pipeline_crashes.json", err.getvalue())
+
+    def test_the_crash_report_survives_a_range_that_cannot_name_a_module(self):
+        # A module was already named and recorded, then the driver aborts without naming
+        # another one. The give-up path must keep the report instead of skipping it.
+        blob = b"\x03\x02\x23\x07"
+        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
+            f.write(blob)
+        named = []
+
+        def script(args, n):
+            if self.is_probe(args):
+                self.inflight_is("b_mod")
+                return ABORT
+            if not named:
+                named.append(n)
+                self.inflight_is("b_mod")
+            return ABORT
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(script)
+        self.assertIsNotNone(failed)
+        self.assertIn("no module could be named", err.getvalue())
+        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual([m["name"] for m in doc["modules"]], ["b_mod"])
+        self.assertEqual(doc["modules"][0]["spv_sha256"],
+                         __import__("hashlib").sha256(blob).hexdigest())
+
+    def test_a_failed_crash_report_does_not_hide_the_checker_diagnostic(self):
+        # The report is best-effort: a path that cannot be written warns, then the normal
+        # checker failure still names the modules.
+        os.makedirs(os.path.join(self.out, "pipeline_crashes.json"))
+
+        def script(args, n):
+            if self.is_probe(args):
+                self.inflight_is("b_mod")
+                return ABORT
+            if n == 1:
+                self.inflight_is("b_mod")
+                return ABORT
+            return 1
+
+        with mock.patch("sys.stderr", io.StringIO()):
+            err, logs = self.stage(script)
+        self.assertIsNotNone(err)
+        self.assertIn("vk_pipeline_check", err.getvalue())
+        self.assertIn("b_mod", err.getvalue())
+        self.assertTrue(any("cannot write pipeline_crashes.json" in line for line in logs))
+
+    def test_a_clean_run_drops_an_old_crash_report(self):
+        os.makedirs(self.out)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write('{"modules": []}')
+        failed, _ = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertFalse(os.path.exists(report))
 
     def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):
         os.makedirs(self.out)

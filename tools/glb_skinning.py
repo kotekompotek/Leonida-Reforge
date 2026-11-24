@@ -6,12 +6,12 @@ Usage:
 The tool parses the GLB container itself (12-byte header, JSON chunk, optional
 BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
 
-* skin names, joint counts and inverseBindMatrices counts,
+* skin names, unique joint nodes, joint counts and inverseBindMatrices counts,
 * the inverseBindMatrices accessor type and finite values,
 * which mesh primitives carry skinning data and which are static,
-* JOINTS_n/WEIGHTS_n pairing, accessor types and vertex counts,
+* consecutive JOINTS_n/WEIGHTS_n pairs starting at 0, accessor types and vertex counts,
 * per-vertex weight sums, handled as FLOAT, normalized UNSIGNED_BYTE or
-  normalized UNSIGNED_SHORT,
+  normalized UNSIGNED_SHORT (exact integer sums for all-quantized sets),
 * joint-index ranges and out-of-range counts,
 * non-finite POSITION, weight and inverseBindMatrices values,
 * the POSITION bounding box, computed from the accessor data.
@@ -20,6 +20,8 @@ Missing optional fields are reported as null; they are never filled in with a
 guess. A malformed container, a file with no skin, or a skin whose
 inverseBindMatrices count differs from its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
+
+Each joint's inverse bind matrix must have the affine fourth row (0, 0, 0, 1).
 
 Only the standard library is used, and the input is read, never modified.
 """
@@ -195,6 +197,8 @@ def parse_glb(data):
     try:
         text = json_chunk.decode("utf-8")
         gltf = json.loads(text, parse_constant=_reject_json_constant)
+    except RecursionError as exc:
+        raise GlbSkinError("invalid GLB JSON chunk: nesting is too deep") from exc
     except (UnicodeDecodeError, ValueError) as exc:
         raise GlbSkinError(f"invalid GLB JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
@@ -434,9 +438,13 @@ def _validate_skins(gltf, reader, warnings, errors):
                 f"{_skin_label(skin_index, name)} has "
                 f"{'no joints' if joints_present else 'no joints field'}"
             )
+        seen_joints = set()
         for joint_offset, joint in enumerate(joints):
             if not _is_int(joint):
                 raise GlbSkinError(f"{path}.joints[{joint_offset}] must be an integer")
+            if joint in seen_joints:
+                errors.append(f"{path}.joints[{joint_offset}]: duplicate joint node {joint}")
+            seen_joints.add(joint)
             if joint < 0 or joint >= len(nodes):
                 errors.append(
                     f"{_skin_label(skin_index, name)} joint {joint_offset} references "
@@ -496,8 +504,18 @@ def _validate_skins(gltf, reader, warnings, errors):
                     f"{meta['component_type_name']} is not FLOAT"
                 )
             bad = 0
-            for row in values:
+            first_non_affine = None
+            for index, row in enumerate(values):
                 bad += sum(1 for value in row if not math.isfinite(value))
+                # glTF stores MAT4 columns consecutively; translation is in the last column.
+                if (first_non_affine is None and index < len(joints) and meta["type"] == "MAT4"
+                        and row[3::4] != (0.0, 0.0, 0.0, 1.0)):
+                    first_non_affine = index
+            if first_non_affine is not None:
+                errors.append(
+                    f"{_skin_label(skin_index, name)}: inverseBindMatrices[{first_non_affine}] "
+                    "fourth row must be [0, 0, 0, 1]"
+                )
             inverse["non_finite_count"] = bad
             if bad:
                 errors.append(
@@ -595,7 +613,12 @@ def _read_weight_set(reader, accessor_index, primitive_path, set_index, errors):
         "max": max(finite) if finite else None,
         "non_finite_count": non_finite,
     }
-    return rows, meta, report
+    # Preserve integer sums before dequantization: u8 * 257 and u16 share denominator 65535.
+    units = None
+    if meta["normalized"] and component_type in (5121, 5123):
+        factor = 257 if component_type == 5121 else 1
+        units = [sum(row) * factor for row in values]
+    return rows, meta, report, units
 
 
 def _read_joint_set(reader, accessor_index, primitive_path, set_index, errors):
@@ -687,9 +710,12 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
         for match in [ATTRIBUTE_RE.match(key)]
         if match
     })
+    if any(number != expected for expected, number in enumerate(set_numbers)):
+        errors.append(f"{path}: JOINTS/WEIGHTS sets must be consecutive starting at 0")
     joint_reports = []
     weight_reports = []
     weight_rows_by_set = {}
+    quantized_units_by_set = {}
     joint_rows_by_set = {}
     first_set_count = None
     for set_number in set_numbers:
@@ -707,10 +733,12 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
             first_set_count = meta["count"] if first_set_count is None else first_set_count
             joint_reports.append(joint_report)
         if weight_key in attributes:
-            weight_rows, meta, weight_report = _read_weight_set(
+            weight_rows, meta, weight_report, units = _read_weight_set(
                 reader, attributes[weight_key], path, set_number, errors
             )
             weight_rows_by_set[set_number] = weight_rows
+            if units is not None:
+                quantized_units_by_set[set_number] = units
             first_set_count = meta["count"] if first_set_count is None else first_set_count
             weight_reports.append(weight_report)
 
@@ -827,6 +855,8 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
     common_weight_count = min(
         (len(rows) for rows in weight_rows_by_set.values()), default=0
     )
+    all_quantized = bool(weight_rows_by_set) and len(quantized_units_by_set) == len(weight_rows_by_set)
+    sum_tolerance = 0.0 if all_quantized else WEIGHT_SUM_TOLERANCE
     for vertex in range(common_weight_count):
         values = []
         for set_number in sorted(weight_rows_by_set):
@@ -837,7 +867,9 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
             total = sum(values)
             weight_min = total if weight_min is None else min(weight_min, total)
             weight_max = total if weight_max is None else max(weight_max, total)
-            if abs(total - 1.0) > WEIGHT_SUM_TOLERANCE:
+            bad_sum = (sum(units[vertex] for units in quantized_units_by_set.values()) != 65535
+                       if all_quantized else abs(total - 1.0) > sum_tolerance)
+            if bad_sum:
                 bad_weight_sums += 1
                 if first_bad_sum is None:
                     first_bad_sum = (vertex, total)
@@ -846,7 +878,7 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
         suffix = f"; {bad_weight_sums} vertices bad" if bad_weight_sums > 1 else ""
         errors.append(
             f"{path} vertex {vertex}: weight sum {total:.7g} != 1 "
-            f"(tolerance {WEIGHT_SUM_TOLERANCE:g}){suffix}"
+            f"(tolerance {sum_tolerance:g}){suffix}"
         )
     if non_finite_weights:
         errors.append(f"{path} has {non_finite_weights} non-finite weight value(s)")
@@ -872,7 +904,7 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
             "min": weight_min,
             "max": weight_max,
             "bad_count": bad_weight_sums,
-            "tolerance": WEIGHT_SUM_TOLERANCE,
+            "tolerance": sum_tolerance,
         },
         "non_finite": {
             "positions": non_finite_positions,

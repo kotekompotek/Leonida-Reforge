@@ -83,6 +83,9 @@ struct ResourceBinding {
     bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
                                          // so views may reinterpret it as typeless resources do.
+    // A UAV texture stored as a mutable unsigned image because its format has no storage support (R16_UINT for
+    // A1R5G5B5): the format its render-target views use. UNDEFINED otherwise.
+    VkFormat uint_backed = VK_FORMAT_UNDEFINED;
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
@@ -709,11 +712,18 @@ struct OcclusionSegmentPool {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyQueryPool destroy = nullptr;
     VkQueryPool pool = VK_NULL_HANDLE;
+    // Pipeline-statistics segments only: a second pool with the counters a mesh draw allows (D3D-291), and for each
+    // segment index whether it runs there. Empty when no segment of the submission holds a mesh draw.
+    VkQueryPool mesh_pool = VK_NULL_HANDLE;
+    std::vector<std::uint8_t> mesh;
 
     OcclusionSegmentPool() = default;
     OcclusionSegmentPool(const OcclusionSegmentPool&) = delete;
     OcclusionSegmentPool& operator=(const OcclusionSegmentPool&) = delete;
-    ~OcclusionSegmentPool() { if (pool) destroy(device, pool, nullptr); }
+    ~OcclusionSegmentPool() {
+        if (pool) destroy(device, pool, nullptr);
+        if (mesh_pool) destroy(device, mesh_pool, nullptr);
+    }
 };
 
 struct OcclusionResult {
@@ -758,6 +768,7 @@ struct GraphicsPipeline {
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
+    bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -788,6 +799,7 @@ enum class ReplayResult {
     invalid_predication,
     invalid_query,
     invalid_indirect_arguments,
+    invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
 
@@ -843,6 +855,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
+    PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -861,9 +874,11 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
     // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS, outside conditional
-    // rendering: the segments of a statistics query split around resolves (D3D-162).
-    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
-                       VkBuffer dst, VkDeviceSize offset)> sum_statistics;
+    // rendering: the segments of a statistics query split around resolves (D3D-162) and mesh draws (D3D-291).
+    // Segment i is in the second pool when mesh[i] is set (mesh may be null: none is).
+    std::function<void(VkCommandBuffer, VkQueryPool, VkQueryPool mesh_pool, const std::uint8_t* mesh,
+                       std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset)>
+        sum_statistics;
     // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -898,6 +913,10 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
+    // CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild on KHR acceleration structures.
+    PFN_vkCmdCopyAccelerationStructureKHR copy_acceleration_structure = nullptr;
+    PFN_vkCmdWriteAccelerationStructuresPropertiesKHR write_acceleration_structures_properties = nullptr;
+    std::function<bool(std::uint32_t count, VkQueryPool& pool, std::uint32_t& first)> prepare_khr_postbuild;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
     std::function<void(VkCommandBuffer, const PredicateCapture&)> capture_predicate;
@@ -937,6 +956,9 @@ struct QueryResolveRun {
     std::uint32_t count = 0;
     VkDeviceSize offset = 0;
     bool sum = false;
+    // Statistics segments: the mesh-compatible pool and the kind of each segment (OcclusionSegmentPool::mesh).
+    VkQueryPool mesh_pool = VK_NULL_HANDLE;
+    const std::uint8_t* mesh = nullptr;
 };
 
 struct PreparedQuery {
@@ -957,8 +979,17 @@ struct PreparedQuery {
     std::vector<QueryResolveRun> resolves;
 };
 
+struct PreparedKhrPostbuild {
+    VkBuffer dst_buffer = VK_NULL_HANDLE;
+    VkDeviceSize dst_offset = 0;
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    std::uint32_t first_query = 0;
+    std::vector<VkAccelerationStructureKHR> sources;
+};
+
 struct Prepared {
-    // Helper commands split the active statistics query just like query resolves.
+    // Helper commands split the active statistics query just like query resolves, and so does a draw whose kind (mesh
+    // or vertex) differs from the draws before it in the current segment (plan_statistics_segments, D3D-291).
     std::uint32_t statistics_end = PreparedQuery::no_segment;
     std::uint32_t statistics_begin = PreparedQuery::no_segment;
     PredicateCapture predicate;
@@ -1009,6 +1040,7 @@ struct Prepared {
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
+    std::uint32_t khr_postbuild = ~0u;  // index into PreparedList::khr_postbuilds; ~0u: skipped or XDXR
 };
 
 inline constexpr std::size_t max_render_targets = 8;  // D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
@@ -1192,6 +1224,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
     const auto format = static_cast<VkFormat>(target.format);
+    if (resource.uint_backed && format == resource.uint_backed) return format;  // its logical format, listed at creation
     const int family = typeless_view_family(format);
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
@@ -2068,6 +2101,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -2262,6 +2297,9 @@ public:
     // The list's statistics queries overlap (D3D-252): without a statistics pool they cannot run whole, because
     // two Vulkan queries of one type may not be active at once; QueryReplay::plan refuses such a list.
     bool statistics_overlaps = false;
+    // For each of those segments, whether it holds mesh draws and so runs in statistics_mesh_pool (D3D-291).
+    std::vector<std::uint8_t> statistics_mesh;
+    VkQueryPool statistics_mesh_pool = VK_NULL_HANDLE;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2269,6 +2307,7 @@ public:
     // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
     bool wrote_readback = false;
     VkPipelineStageFlags2 readback_src_stages = 0;
+    std::vector<detail::PreparedKhrPostbuild> khr_postbuilds;
 };
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
@@ -2305,37 +2344,74 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
+// A mesh draw cannot run while a query with the input-assembly, vertex, geometry or tessellation counters is active
+// (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as 0. A query
+// that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in the full pool
+// or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of its own kind.
+// Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
+// has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
 inline void plan_statistics_segments(PreparedList& out) {
     detail::PreparedQuery* begin = nullptr;
-    struct Split { std::uint32_t* end; std::uint32_t* begin; };
-    std::vector<Split> inner;
+    // A split point (a helper or a resolve), or a draw: kind 0 vertex, 1 mesh.
+    struct Event { std::uint32_t* end; std::uint32_t* begin; int kind; };
+    std::vector<Event> inner;
+    bool splits = false, mesh = false;
     std::size_t next_query = 0;
+    const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect))
-            inner.push_back({&p.statistics_end, &p.statistics_begin});
+                      p.counted_dispatch.indirect)) {
+            inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
+            splits = true;
+        }
+        if (begin) {
+            int kind = -1;
+            if (const auto* draw = std::get_if<Draw>(&commands[i])) kind = draw->mesh ? 1 : 0;
+            else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
+                kind = indirect->kind == IndirectKind::dispatch ? -1 : 0;
+            if (kind >= 0) inner.push_back({&p.statistics_end, &p.statistics_begin, kind});
+            mesh |= kind == 1;
+        }
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
-        const Command& command = out.list->commands()[i];
+        const Command& command = commands[i];
         const auto range = query_range(command);
         if (std::holds_alternative<ResolveQueries>(command)) {
             // A stream-output resolve only fills zeros (no dispatch), so it needs no split.
-            if (begin && range.type != d3d12_query::timestamp && !is_so_statistics(range.type))
-                inner.push_back({&query.statistics_end, &query.statistics_begin});
+            if (begin && range.type != d3d12_query::timestamp && !is_so_statistics(range.type)) {
+                inner.push_back({&query.statistics_end, &query.statistics_begin, -1});
+                splits = true;
+            }
         } else if (range.type == d3d12_query::pipeline_statistics) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
                 inner.clear();
+                splits = mesh = false;
             } else if (begin) {
-                if (!inner.empty()) {
+                if (splits || mesh) {
                     const std::uint32_t first = out.statistics_segment_count;
-                    begin->statistics_begin = out.statistics_segment_count++;
-                    for (auto split : inner) {
-                        *split.end = out.statistics_segment_count - 1;
-                        *split.begin = out.statistics_segment_count++;
+                    const auto open = [&] {
+                        out.statistics_mesh.push_back(0);
+                        return out.statistics_segment_count++;
+                    };
+                    std::uint32_t current = begin->statistics_begin = open();
+                    int kind = -1;  // of the current segment's draws, -1 before its first
+                    for (const auto& event : inner) {
+                        if (event.kind < 0) {
+                            *event.end = current;
+                            current = *event.begin = open();
+                            kind = -1;
+                            continue;
+                        }
+                        if (kind >= 0 && event.kind != kind) {
+                            *event.end = current;
+                            current = *event.begin = open();
+                        }
+                        kind = event.kind;
+                        out.statistics_mesh[current] = std::uint8_t(kind);
                     }
-                    query.statistics_end = out.statistics_segment_count - 1;
+                    query.statistics_end = current;
                     query.statistics_first = first;
                     query.statistics_count = out.statistics_segment_count - first;
                 }
@@ -2355,6 +2431,14 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
     std::size_t next_query = 0;
+    // Each physical segment's draw kind (D3D-291): -1 before its first draw, 0 vertex, 1 mesh.
+    int kind = -1;
+    const auto open = [&] {
+        out.statistics_mesh.push_back(0);
+        kind = -1;
+        return out.statistics_segment_count++;
+    };
+    const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         detail::PreparedQuery* query = nullptr;
@@ -2366,8 +2450,23 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
                                     p.counted_dispatch.indirect)) {
                 p.statistics_end = current;
-                current = out.statistics_segment_count++;
+                current = open();
                 p.statistics_begin = current;
+                continue;
+            }
+            // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
+            int draw = -1;
+            if (const auto* d = std::get_if<Draw>(&commands[i])) draw = d->mesh ? 1 : 0;
+            else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
+                draw = indirect->kind == IndirectKind::dispatch ? -1 : 0;
+            if (!active.empty() && draw >= 0) {
+                if (kind >= 0 && draw != kind) {
+                    p.statistics_end = current;
+                    current = open();
+                    p.statistics_begin = current;
+                }
+                kind = draw;
+                out.statistics_mesh[current] = std::uint8_t(draw);
             }
             continue;
         }
@@ -2391,11 +2490,11 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         } else {
             if (current == detail::PreparedQuery::no_segment || range.type == d3d12_query::timestamp) continue;
             query->statistics_end = current;
-            current = out.statistics_segment_count++;
+            current = open();
             query->statistics_begin = current;
             continue;
         }
-        current = active.empty() ? detail::PreparedQuery::no_segment : out.statistics_segment_count++;
+        current = active.empty() ? detail::PreparedQuery::no_segment : open();
         query->statistics_begin = current;
     }
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
@@ -2466,8 +2565,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
     out.precise_segments = false;
-    out.statistics_pool = VK_NULL_HANDLE;
+    out.statistics_pool = out.statistics_mesh_pool = VK_NULL_HANDLE;
     out.statistics_base = out.statistics_segment_count = 0;
+    out.statistics_mesh.clear();
+    out.khr_postbuilds.clear();
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
     const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
@@ -2840,8 +2941,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             for (const auto& d : atomic->dependencies) {
                 const ResourceBinding* dependent = resolve(d.resource);
                 if (!dependent) return ReplayResult::unresolved_resource;
-                if (!dependent->image && (d.subresource != 0 || d.begin > d.end || d.end > dependent->size))
-                    return ReplayResult::invalid_copy;
+                if (!dependent->image) {
+                    const std::uint64_t end = d.end == UINT64_MAX ? dependent->size : d.end;
+                    if (d.subresource != 0 || d.begin >= end || end > dependent->size)
+                        return ReplayResult::invalid_copy;
+                }
             }
             p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
                                        p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
@@ -2912,8 +3016,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
-            const VkDeviceSize bytes = VkDeviceSize(ind->max_count - 1) * ind->stride + record_size;
-            if (!detail::indirect_range(p.binding, ind->argument_offset, bytes))
+            // The span is max_count * stride, the bytes the signature can walk, as D3D12 measures it: a record that
+            // fits at the end of the buffer while its stride runs past it is refused (`240` with stride `20` in a
+            // `256`-byte buffer). A zero max_count still has to name an offset inside the buffer.
+            if (ind->argument_offset > p.binding.size ||
+                ind->max_count > (p.binding.size - ind->argument_offset) / ind->stride ||
+                !detail::indirect_range(p.binding, ind->argument_offset,
+                                        VkDeviceSize(ind->max_count) * ind->stride))
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
@@ -2966,27 +3075,66 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
-            // the destination's room bounds the copy, as the size is only known to the GPU.
-            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
-            std::uint64_t room = ~std::uint64_t(0);
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceSize offset = 0;
-            if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
-            std::uint64_t source = ~std::uint64_t(0);
-            if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
-            p.xdxr_bytes = std::min(room, source);
-        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
-            // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
-            if (!vk.xdxr_postbuild) {
-                p.skip = true;
+            if (vk.xdxr_copy) {
+                // XDXR structures: the destination's room bounds the copy, as the size is only known to the GPU.
+                if (!vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+                std::uint64_t room = ~std::uint64_t(0);
+                VkBuffer buffer = VK_NULL_HANDLE;
+                VkDeviceSize offset = 0;
+                if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                std::uint64_t source = ~std::uint64_t(0);
+                if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
+                p.xdxr_bytes = std::min(room, source);
             } else {
+                if (vk.queue_stages == detail::queue_stages_copy || !vk.copy_acceleration_structure ||
+                    !vk.resolve_acceleration_structure || copy->mode > 1)
+                    return ReplayResult::unsupported;
+                p.accel_dst = vk.resolve_acceleration_structure(copy->dst_va);
+                p.accel_src = vk.resolve_acceleration_structure(copy->src_va);
+                if (!p.accel_dst || !p.accel_src) return ReplayResult::unresolved_resource;
+                // Vulkan forbids overlapping source and destination handles in CLONE/COMPACT copies.
+                if (p.accel_dst == p.accel_src) return ReplayResult::invalid_copy;
+            }
+        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
+            if (vk.xdxr_postbuild) {
                 if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
                 if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+            } else if (info->type == 0 && vk.write_acceleration_structures_properties &&
+                       vk.resolve_acceleration_structure && vk.reset_query_pool && vk.copy_query_pool_results &&
+                       vk.pipeline_barrier && vk.buffer_at && vk.prepare_khr_postbuild) {
+                if (vk.queue_stages == detail::queue_stages_copy || info->sources.empty() ||
+                    info->sources.size() > std::numeric_limits<std::uint32_t>::max() / 8u)
+                    return ReplayResult::unsupported;
+                const std::uint64_t need = 8ull * info->sources.size();
+                std::uint64_t room = need;
+                detail::PreparedKhrPostbuild pb;
+                if (!vk.buffer_at(info->dest_va, room, pb.dst_buffer, pb.dst_offset))
+                    return ReplayResult::unresolved_resource;
+                // vkCmdCopyQueryPoolResults with VK_QUERY_RESULT_64_BIT requires an 8-byte aligned dstOffset.
+                if (!pb.dst_buffer || room < need || (pb.dst_offset % 8) != 0)
+                    return ReplayResult::invalid_copy;
+                pb.sources.reserve(info->sources.size());
+                for (const std::uint64_t src_va : info->sources) {
+                    const VkAccelerationStructureKHR as = vk.resolve_acceleration_structure(src_va);
+                    if (!as) return ReplayResult::unresolved_resource;
+                    pb.sources.push_back(as);
+                }
+                if (!vk.prepare_khr_postbuild(static_cast<std::uint32_t>(pb.sources.size()), pb.query_pool,
+                                              pb.first_query) ||
+                    !pb.query_pool)
+                    return ReplayResult::unsupported;
+                p.khr_postbuild = static_cast<std::uint32_t>(out.khr_postbuilds.size());
+                out.khr_postbuilds.push_back(std::move(pb));
+                // dest_va is resolved by VA and may target a host-readable buffer in COPY_DEST.
+                out.wrote_readback = true;
+                out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            } else {
+                // Other postbuild info types (or callers without KHR postbuild wired) keep skipping rather than failing.
+                p.skip = true;
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
@@ -3037,10 +3185,16 @@ public:
             list.segment_base = base;
         }
         if (list.statistics_segment_count) {
-            if (statistics_pool) {
+            const bool mesh = std::find(list.statistics_mesh.begin(), list.statistics_mesh.end(), 1) !=
+                              list.statistics_mesh.end();
+            if (statistics_pool && (!mesh || statistics_pool->mesh_pool)) {
                 retain(statistics_pool);
                 list.statistics_pool = statistics_pool->pool;
+                list.statistics_mesh_pool = statistics_pool->mesh_pool;
                 list.statistics_base = statistics_base;
+            } else if (mesh) {
+                // Unsplit, the query would be active around a mesh draw with counters Vulkan forbids there.
+                return ReplayResult::unsupported;
             } else if (list.statistics_overlaps) {
                 // Whole queries on the heap pool would keep two pipeline-statistics queries active at once.
                 return ReplayResult::unsupported;
@@ -3087,7 +3241,14 @@ public:
                         if (resolve.type != d3d12_query::occlusion && !binary && !statistics)
                             return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
-                        run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
+                        const std::uint8_t* kinds = saved.segments->mesh.empty() ? nullptr
+                                                                                 : saved.segments->mesh.data();
+                        // A mesh segment's four counters go through the sum to land in their D3D12 fields.
+                        const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
+                                                                 std::uint8_t(1)) != kinds + saved.first + saved.count;
+                        run = {saved.segments->pool, saved.first, saved.count, run.offset,
+                               saved.count > 1 || any_mesh, saved.segments->mesh_pool, kinds};
+                        if (any_mesh && !statistics) return ReplayResult::invalid_query;
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
                         if (statistics) needs_statistics_sum |= run.sum;
                         else if (binary) (run.sum ? needs_sum_binary : needs_binary) = true;
@@ -3142,6 +3303,29 @@ private:
     std::map<std::pair<QueryPool*, std::uint32_t>, Value> pending_;
 };
 
+namespace detail {
+
+// A physical pipeline-statistics segment (plan_statistics_segments), in the pool its kind needs.
+inline VkQueryPool statistics_segment_pool(const PreparedList& list, std::uint32_t segment) {
+    return list.statistics_mesh[segment] ? list.statistics_mesh_pool : list.statistics_pool;
+}
+
+inline void end_statistics_segment(const PreparedList& list, std::uint32_t segment, VkCommandBuffer cb,
+                                   const ReplayFunctions& vk) {
+    if (segment == PreparedQuery::no_segment) return;
+    vk.end_query(cb, statistics_segment_pool(list, segment), list.statistics_base + segment);
+}
+
+inline void begin_statistics_segment(const PreparedList& list, std::uint32_t segment, VkCommandBuffer cb,
+                                     const ReplayFunctions& vk) {
+    if (segment == PreparedQuery::no_segment) return;
+    const auto pool = statistics_segment_pool(list, segment);
+    vk.reset_query_pool(cb, pool, list.statistics_base + segment, 1);
+    vk.begin_query(cb, pool, list.statistics_base + segment, 0);
+}
+
+}  // namespace detail
+
 inline void emit_query(const PreparedList& list, const detail::PreparedQuery& query, VkCommandBuffer cb,
                        const ReplayFunctions& vk, const VkConditionalRenderingBeginInfoEXT& predicate) {
     constexpr auto none = detail::PreparedQuery::no_segment;
@@ -3155,16 +3339,8 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         return;
     }
     // A split pipeline-statistics query (plan_statistics_segments): its counters run in the physical segments.
-    const auto end_statistics = [&] {
-        if (query.statistics_end != none)
-            vk.end_query(cb, list.statistics_pool, list.statistics_base + query.statistics_end);
-    };
-    const auto begin_statistics = [&] {
-        if (query.statistics_begin == none) return;
-        const auto index = list.statistics_base + query.statistics_begin;
-        vk.reset_query_pool(cb, list.statistics_pool, index, 1);
-        vk.begin_query(cb, list.statistics_pool, index, 0);
-    };
+    const auto end_statistics = [&] { detail::end_statistics_segment(list, query.statistics_end, cb, vk); };
+    const auto begin_statistics = [&] { detail::begin_statistics_segment(list, query.statistics_begin, cb, vk); };
     const auto& command = list.list->commands()[query.command];
     const QueryPool& heap = *query.heap;
     if (!std::holds_alternative<ResolveQueries>(command) &&
@@ -3206,7 +3382,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
-                vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
+                vk.sum_statistics(cb, run.pool, run.mesh_pool, run.mesh, run.first, run.count, dst, run.offset);
             } else if (run.sum && binary) {
                 vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
@@ -3260,15 +3436,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         }
         // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
         const auto end_statistics = [&] {
-            if (p.statistics_end != detail::PreparedQuery::no_segment)
-                vk.end_query(command_buffer, prepared.statistics_pool, prepared.statistics_base + p.statistics_end);
+            detail::end_statistics_segment(prepared, p.statistics_end, command_buffer, vk);
         };
         const auto begin_statistics = [&] {
-            if (p.statistics_begin == detail::PreparedQuery::no_segment) return;
-            const auto index = prepared.statistics_base + p.statistics_begin;
-            vk.reset_query_pool(command_buffer, prepared.statistics_pool, index, 1);
-            vk.begin_query(command_buffer, prepared.statistics_pool, index, 0);
+            detail::begin_statistics_segment(prepared, p.statistics_begin, command_buffer, vk);
         };
+        // A draw of the other kind inside a statistics query starts a segment in its pool (D3D-291), before the
+        // draw's own rendering scope begins.
+        if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
+            end_statistics();
+            begin_statistics();
+        }
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
@@ -3840,11 +4018,46 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+            if (vk.xdxr_copy) {
+                vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+            } else {
+                VkCopyAccelerationStructureInfoKHR copy_info{VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR};
+                copy_info.src = p.accel_src;
+                copy_info.dst = p.accel_dst;
+                copy_info.mode = copy->mode == 1 ? VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR
+                                                 : VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR;
+                vk.copy_acceleration_structure(command_buffer, &copy_info);
+            }
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
-            for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
-                vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+            if (vk.xdxr_postbuild) {
+                for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
+                    vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+            } else if (p.khr_postbuild < prepared.khr_postbuilds.size()) {
+                const auto& pb = prepared.khr_postbuilds[p.khr_postbuild];
+                const auto count = static_cast<std::uint32_t>(pb.sources.size());
+                // Ensure an inline BuildRaytracingAccelerationStructure (or preceding copy) is visible before query read.
+                VkMemoryBarrier as_mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                as_mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                as_mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                vk.pipeline_barrier(command_buffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &as_mb, 0, nullptr,
+                                    0, nullptr);
+                vk.reset_query_pool(command_buffer, pb.query_pool, pb.first_query, count);
+                vk.write_acceleration_structures_properties(
+                    command_buffer, count, pb.sources.data(),
+                    VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, pb.query_pool, pb.first_query);
+                vk.copy_query_pool_results(command_buffer, pb.query_pool, pb.first_query, count, pb.dst_buffer,
+                                           pb.dst_offset, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                // Make query result writes visible to D3D12 UNORDERED_ACCESS shaders and subsequent CopyBufferRegion.
+                VkMemoryBarrier dst_mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                dst_mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                dst_mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vk.pipeline_barrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT | shader_stages, 0, 1, &dst_mb, 0, nullptr, 0,
+                                    nullptr);
+            }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
@@ -3974,12 +4187,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
-            vk.set_primitive_topology(command_buffer, topology);
-            const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                 ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                  (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
-            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
+            // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
+            if (!draw->mesh) {
+                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                vk.set_primitive_topology(command_buffer, topology);
+                const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                     ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                      (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
+                vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
@@ -3988,7 +4205,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->indexed) {
+            if (draw->mesh) {
+                vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);

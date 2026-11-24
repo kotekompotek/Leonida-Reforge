@@ -680,6 +680,17 @@ class ShardFileTest(unittest.TestCase):
                     with open(path0, "w", encoding="utf-8") as f:
                         json.dump(doc, f)
                     self.assertEqual(WC._read_shard(tmp, want[0], source_id), doc if valid else None)
+            row = {"offset": 64, "stored": 10, "entities": 3, "sha1": "ab"}
+            for rows, valid in (([row], True), ([{**row, "entities": None}], False),
+                                ([{**row, "entities": True}], False), ([{**row, "offset": False}], False),
+                                ([{**row, "stored": "10"}], False), ([{k: v for k, v in row.items() if k != "sha1"}], False),
+                                ([True], False), ([None], False), (["row"], False), ([[]], False),
+                                ([row, 5], False)):
+                with self.subTest(rows=rows):
+                    doc = {**good, "rows": rows}
+                    with open(path0, "w", encoding="utf-8") as f:
+                        json.dump(doc, f)
+                    self.assertEqual(WC._read_shard(tmp, want[0], source_id), doc if valid else None)
             with open(path0, "w", encoding="utf-8") as f:
                 f.write("{")
             self.assertIsNone(WC._read_shard(tmp, want[0], source_id))
@@ -764,11 +775,11 @@ class MainTest(unittest.TestCase):
                 self.assertEqual(out, "")
         self.assertFalse(os.path.exists(self.out))
 
-    def test_same_output_path_identity(self):
+    def test_same_report_path_identity(self):
         a = os.path.join(self.dir, "test.rpf")
-        self.assertTrue(WC.same_output_path(a, a))
+        self.assertTrue(WC.same_report_path(a, a))
         b = os.path.join(self.dir, "other.rpf")
-        self.assertFalse(WC.same_output_path(a, b))
+        self.assertFalse(WC.same_report_path(a, b))
 
     def test_out_matching_archive_or_reports_is_rejected(self):
         code, _, err = self.run_main(self.arc, "--out", self.arc)

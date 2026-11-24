@@ -55,6 +55,14 @@ struct KhrInstanceStage {
     std::uint64_t size = 0;  // bytes available in buffer, so a larger later list can be refused for a new stage
 };
 
+// One per-queue query pool of VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, retained on the
+// CommandSlot until its submission completes and then recycled to the queue pool.
+struct KhrAsQueryPool {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    std::uint32_t capacity = 0;
+    std::uint32_t used = 0;
+};
+
 // VK_EXT_debug_utils labels: an instance extension, so a device has them only when its instance enabled it.
 struct DebugLabelFunctions {
     PFN_vkCmdInsertDebugUtilsLabelEXT cmd_insert = nullptr;
@@ -85,7 +93,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
     X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
     X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
-    X(vkCmdBuildAccelerationStructuresKHR)                                                                    \
+    X(vkCmdBuildAccelerationStructuresKHR) X(vkCmdCopyAccelerationStructureKHR)                                \
+    X(vkCmdWriteAccelerationStructuresPropertiesKHR)                                                           \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
     X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                          \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
@@ -96,16 +105,17 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)                     \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
-    // extension is not enabled, and the query functions are optional (a list that uses queries without them is
-    // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
+    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering, mesh
+    // shaders) when the extension is not enabled, and the query functions are optional (a list that uses queries
+    // without them is unsupported). The compute and descriptor functions are needed for normalized or summed
+    // occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -211,7 +221,8 @@ public:
         write.pBufferInfo = &storage;
         vk_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 
-        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+        // The count, and for statistics_sum.comp whether the segments are mesh-pool results.
+        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1;
         layout.pSetLayouts = &set_layout_;
@@ -231,21 +242,28 @@ public:
                 create_pipeline(statistics_sum_spirv, statistics_pipeline_));
     }
 
-    // Adds `count` pipeline-statistics results (11 counters each) into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at
-    // dst + offset: the segments of a statistics query that was split around helper dispatches (D3D-162).
-    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
-                        VkBuffer dst, VkDeviceSize offset) const {
+    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
+    // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
+    // Segment i is in `mesh_queries` when mesh[i] is set (four counters: clipping, fragment and compute; see
+    // statistics_sum.comp), otherwise in `queries` (all eleven).
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, const std::uint8_t* mesh,
+                        std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
         constexpr VkDeviceSize result = statistics_counters * word_size;
+        constexpr VkDeviceSize mesh_slot = 5 * word_size;  // CInvocations, where the mesh pool's first counter goes
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
         while (count) {
-            const auto chunk = std::min(count, statistics_capacity);
-            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, result, result,
+            const bool in_mesh = mesh && mesh[first];
+            std::uint32_t chunk = 1;
+            while (chunk < std::min(count, statistics_capacity) && bool(mesh && mesh[first + chunk]) == in_mesh)
+                ++chunk;
+            vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
+                                          result + (in_mesh ? mesh_slot : 0), result,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
-            dispatch(cb, chunk, 1);
+            dispatch(cb, chunk, 1, in_mesh);
             first += chunk;
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -339,8 +357,9 @@ private:
         vk_.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
     }
 
-    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups) const {
-        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(chunk), &chunk);
+    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups, bool mesh = false) const {
+        const std::uint32_t range[2] = {chunk, mesh ? 1u : 0u};
+        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(range), range);
         vk_.vkCmdDispatch(cb, groups, 1, 1);
     }
 
@@ -956,6 +975,7 @@ public:
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
+        replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1033,6 +1053,8 @@ public:
         }
         if (!xdxr_ && ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
             replay_.build_acceleration_structures = vk.vkCmdBuildAccelerationStructuresKHR;
+            replay_.copy_acceleration_structure = vk.vkCmdCopyAccelerationStructureKHR;
+            replay_.write_acceleration_structures_properties = vk.vkCmdWriteAccelerationStructuresPropertiesKHR;
             replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
                 const auto it = acceleration_structures_.find(va);
                 return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
@@ -1139,6 +1161,16 @@ public:
 
     void add_sparse_resource(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseResource> sparse) {
         std::unique_lock lock(resource_mutex_);
+        if (!binding.image) {
+            auto [it, inserted] = sparse_resources_.try_emplace(id, std::move(sparse));
+            try {
+                set_resource_locked(id, binding);
+            } catch (...) {
+                if (inserted) sparse_resources_.erase(it);
+                throw;
+            }
+            return;
+        }
         set_resource_locked(id, binding);
         sparse_resources_.emplace(id, std::move(sparse));
         if (binding.image) {
@@ -1519,11 +1551,20 @@ private:
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
     void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
         auto [it, inserted] = resources_.try_emplace(id, binding);
+        if (addressable(binding)) {
+            try {
+                buffer_vas_.insert(binding.va, binding.size, id);
+            } catch (...) {
+                if (inserted) resources_.erase(it);
+                throw;
+            }
+        }
         if (!inserted) {
-            unindex_buffer(id, it->second);
+            // A same-VA insert updates its size in place; removing the old key would remove the new range.
+            if (addressable(it->second) && (!addressable(binding) || it->second.va != binding.va))
+                unindex_buffer(id, it->second);
             it->second = binding;
         }
-        if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -1798,7 +1839,14 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
-        context_.holds().attach(this);
+        try {
+            context_.holds().attach(this);
+        } catch (...) {
+            // A failed registration leaves no queue to run the destructor for these Vulkan handles.
+            if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
+            if (pool_) vk.vkDestroyCommandPool(context.device(), pool_, nullptr);
+            throw;
+        }
     }
 
     ~VulkanQueue() {
@@ -1830,8 +1878,10 @@ public:
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
         destroy_khr_stages(khr_stage_pool_);
+        destroy_khr_as_queries(khr_as_query_pool_);
         for (auto& slot : buffers_) {
             destroy_khr_stages(slot.khr_instances);
+            destroy_khr_as_queries(slot.khr_as_queries);
             free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
         }
         for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
@@ -2025,6 +2075,7 @@ private:
     // Completed stages, reused by later ARRAY_OF_POINTERS builds. Only execute_now() touches the pool, and it holds
     // state_mutex_ (including the deferred/held release paths), so no extra lock is needed.
     std::vector<KhrInstanceStage> khr_stage_pool_;
+    std::vector<KhrAsQueryPool> khr_as_query_pool_;
 
     void destroy_khr_stages(std::vector<KhrInstanceStage>& stages) {
         for (const auto& stage : stages) {
@@ -2038,6 +2089,59 @@ private:
     void recycle_khr_stages(std::vector<KhrInstanceStage>& stages) {
         for (auto& stage : stages) khr_stage_pool_.push_back(std::move(stage));
         stages.clear();
+    }
+
+    void destroy_khr_as_queries(std::vector<KhrAsQueryPool>& pools) {
+        if (context_.vk.vkDestroyQueryPool) {
+            for (const auto& entry : pools) {
+                if (entry.pool) context_.vk.vkDestroyQueryPool(context_.device(), entry.pool, nullptr);
+            }
+        }
+        pools.clear();
+    }
+
+    void recycle_khr_as_queries(std::vector<KhrAsQueryPool>& pools) {
+        for (auto& entry : pools) {
+            entry.used = 0;
+            khr_as_query_pool_.push_back(entry);
+        }
+        pools.clear();
+    }
+
+    bool allocate_khr_as_queries(std::uint32_t count, std::vector<KhrAsQueryPool>& active, VkQueryPool& out_pool,
+                                 std::uint32_t& out_first) {
+        if (!count || !context_.vk.vkCreateQueryPool || !context_.vk.vkDestroyQueryPool) return false;
+        if (!active.empty()) {
+            auto& back = active.back();
+            if (back.used <= back.capacity && count <= back.capacity - back.used) {
+                out_pool = back.pool;
+                out_first = back.used;
+                back.used += count;
+                return true;
+            }
+        }
+        for (auto it = khr_as_query_pool_.begin(); it != khr_as_query_pool_.end(); ++it) {
+            if (it->capacity >= count) {
+                KhrAsQueryPool entry = *it;
+                khr_as_query_pool_.erase(it);
+                entry.used = count;
+                active.push_back(entry);
+                out_pool = entry.pool;
+                out_first = 0;
+                return true;
+            }
+        }
+        const std::uint32_t capacity = std::max<std::uint32_t>(count, 16u);
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+        info.queryCount = capacity;
+        VkQueryPool pool = VK_NULL_HANDLE;
+        if (context_.vk.vkCreateQueryPool(context_.device(), &info, nullptr, &pool) != VK_SUCCESS || !pool)
+            return false;
+        active.push_back({pool, capacity, count});
+        out_pool = pool;
+        out_first = 0;
+        return true;
     }
 
     // A KHR TLAS built with D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS holds console VAs in its pointer list; Vulkan
@@ -2120,7 +2224,10 @@ private:
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
-            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64 || va > UINT64_MAX - vk.heap_base) {
+            // No overflow check on heap_base + va: a buffer outside the arena whose device address lies below the
+            // arena's (an UPLOAD heap in system memory without Resizable BAR) has a VA that wraps (address - base),
+            // and the unsigned sum wraps back to its device address, as the replay's other VA translations do.
+            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64) {
                 funcs.vkUnmapMemory(context_.device(), stage.memory);
                 discard();
                 return ReplayResult::invalid_copy;
@@ -2153,7 +2260,11 @@ private:
         struct KhrGuard {
             VulkanQueue* queue;
             std::vector<KhrInstanceStage> stages;
-            ~KhrGuard() { queue->recycle_khr_stages(stages); }
+            std::vector<KhrAsQueryPool> as_queries;
+            ~KhrGuard() {
+                queue->recycle_khr_stages(stages);
+                queue->recycle_khr_as_queries(as_queries);
+            }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
@@ -2197,6 +2308,12 @@ private:
                                                                    VkDeviceAddress& address) {
             return stage_khr_instances(replay, build, khr_guard.stages, address);
         };
+        if (replay.write_acceleration_structures_properties) {
+            replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
+                                                              std::uint32_t& first) {
+                return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
+            };
+        }
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -2276,9 +2393,10 @@ private:
                                                       std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
-            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
+            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                           const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count,
+                                           VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh, first, count, dst, offset);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2314,10 +2432,31 @@ private:
         };
         std::shared_ptr<OcclusionSegmentPool> physical, statistics;
         if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
-        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before.
-        if (statistics_segments && can_resolve_occlusion &&
-            !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
-            return ReplayResult::unsupported;
+        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before
+        // (QueryReplay::plan refuses a list whose statistics query holds a mesh draw then).
+        if (statistics_segments && can_resolve_occlusion) {
+            if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
+                return ReplayResult::unsupported;
+            for (const auto& list : prepared)
+                statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
+                                        list.statistics_mesh.end());
+            if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
+                statistics->mesh.clear();
+            } else {
+                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): clipping
+                // invocations and primitives, fragment and compute invocations (D3D-291).
+                VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                info.queryCount = statistics_segments;
+                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
+                                          VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+                if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
+                    VK_SUCCESS)
+                    return ReplayResult::unsupported;
+            }
+        }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
         // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
         // see submission-order query state and remove_query_pool() waits until commit finishes.
@@ -2346,6 +2485,8 @@ private:
         if (!slot) return ReplayResult::unsupported;
         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
         khr_guard.stages.clear();
+        slot->khr_as_queries = std::move(khr_guard.as_queries);
+        khr_guard.as_queries.clear();
         command_buffer = slot->buffer;
         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
         // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
@@ -2754,6 +2895,7 @@ private:
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
+        std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
     };
 
     struct PendingBindings {
@@ -2915,6 +3057,7 @@ private:
             if (slot.ticket > done) continue;
             slot.segments.clear();
             recycle_khr_stages(slot.khr_instances);
+            recycle_khr_as_queries(slot.khr_as_queries);
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);

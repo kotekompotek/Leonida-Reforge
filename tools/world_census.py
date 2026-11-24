@@ -36,6 +36,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from report_paths import same_report_path  # noqa: E402
 import world_index as WI
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -635,6 +636,12 @@ def _shard_path(outdir, want):
     return os.path.join(outdir, "shard_%03d_%d_%d.json" % (want["index"], want["start"], want["end"]))
 
 
+def _row_ok(r):
+    """A row as _summarize, _duplicates and _bands read it: ints (not bool) for offset/stored/entities, a str sha1."""
+    return (isinstance(r, dict) and isinstance(r.get("sha1"), str)
+            and all(type(r.get(k)) is int for k in ("offset", "stored", "entities")))
+
+
 def _read_shard(outdir, want, source_id):
     try:
         with open(_shard_path(outdir, want), encoding="utf-8") as f:
@@ -645,7 +652,8 @@ def _read_shard(outdir, want, source_id):
             and source_id is not None and doc.get("source_id") == source_id
             and all(type(doc.get(k)) is int and doc[k] == want[k] for k in ("index", "start", "end"))
             and isinstance(doc.get("stats"), dict)
-            and all(isinstance(doc.get(k), list) for k in ("rows", "intervals", "raw_pages", "raw_system"))):
+            and all(isinstance(doc.get(k), list) for k in ("rows", "intervals", "raw_pages", "raw_system"))
+            and all(_row_ok(r) for r in doc["rows"])):
         return doc
     return None
 
@@ -785,16 +793,6 @@ def job_count(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
@@ -825,14 +823,14 @@ def main(argv=None):
     if start < data_start or start >= end:
         print("bad scan range", file=sys.stderr)
         return 2
-    if same_output_path(a.archive, a.out):
+    if same_report_path(a.archive, a.out):
         print("error: --out must not overwrite the input archive", file=sys.stderr)
         return 2
     if os.path.isfile(a.out):
         print(f"error: --out {a.out} is a file, not a directory", file=sys.stderr)
         return 2
     for report in ("summary.json", "maps.json"):
-        if same_output_path(a.archive, os.path.join(a.out, report)):
+        if same_report_path(a.archive, os.path.join(a.out, report)):
             print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
             return 2
     try:

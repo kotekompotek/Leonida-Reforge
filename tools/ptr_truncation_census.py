@@ -37,7 +37,8 @@ Usage:
 
 <disasm dir> is `<work>/shaders/disasm` (the carve's index.json one level up gives each stage). --json writes the
 summary; --index-out writes {number: {"stage", "user_sgpr_reads"}} with shaders numbered in listing order, not
-named, which `tools/user_sgpr_census.py` reads. Neither prints or writes a shader name, listing or byte.
+named, which `tools/user_sgpr_census.py` reads. Neither prints or writes a shader name, listing or byte. --limit
+stops after that many listings and must be at least 1; a smaller value is a usage error.
 """
 import argparse
 import json
@@ -50,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 STAGES = ("vs", "ps", "cs", "gs", "hs", "ds", "ms", "as")
 TABLE_LOADS = ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
@@ -290,17 +292,30 @@ def listings(src):
         return sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
 
 
+def positive_int(text: str) -> int:
+    """--limit -1 dropped the last listing and --limit 0 scanned none, both with exit 0."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 (a smaller value would silently scan fewer listings)")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=positive_int, help="scan at most this many listings (at least 1)")
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
+    if a.json and a.index_out and same_report_path(a.json, a.index_out):
+        ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
     jobs = pool_workers.process_workers(max(1, a.jobs))
     if jobs == 1 or len(files) < 64:

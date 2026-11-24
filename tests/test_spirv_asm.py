@@ -40,6 +40,90 @@ def _validate(spv: bytes, target_env: str = "vulkan1.2") -> None:
 
 
 class SpirvAsmUnitTests(unittest.TestCase):
+    def test_unicode_separators_remain_in_literal_strings(self):
+        literal = "first\u0085second\u2028third\u2029last"
+        expected = literal.encode("utf-8") + b"\x00"
+        expected += b"\x00" * (-len(expected) % 4)
+        for newline in ("\n", "\r\n", "\r"):
+            with self.subTest(newline=newline):
+                asm = f'%str = OpString "{literal}"{newline}OpNop{newline}'
+                spv = spirv_asm.assemble(asm)
+                words = _literal_words(spv, 7, 1)  # OpString result ID precedes its literal.
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words), expected)
+
+    def test_literal_line_endings_preserve_bytes(self):
+        comment = '; An unmatched " in this comment is ordinary text.'
+        for ending in ("\r", "\r\n", "\n"):
+            with self.subTest(literal_ending=ending):
+                operand = f'first \\"; middle{ending}last'
+                expected = f'first "; middle{ending}last'.encode("utf-8")
+                asm = f'{comment}\r\n%str = OpString "{operand}"\r\nOpNop\r\n'
+                words = _literal_words(spirv_asm.assemble(asm), 7, 1)
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], expected)
+
+    def test_error_line_after_multiline_literal_is_physical_line(self):
+        asm = '; comment\r\n%str = OpString "first\rsecond\r\nthird\nlast"\r\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 6: unknown opcode"):
+            spirv_asm.assemble(asm)
+
+    def test_cli_preserves_literal_crlf_in_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            src = os.path.join(directory, "literal.spvasm")
+            dst = os.path.join(directory, "literal.spv")
+            literal = b"first\r\nsecond"
+            with open(src, "wb") as f:
+                f.write(b'%str = OpString "' + literal + b'"\nOpNop\n')
+            result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(dst, "rb") as f:
+                words = _literal_words(f.read(), 7, 1)
+            self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
+
+    def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
+        canonical = (
+            "OpCapability Shader\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            '%file = OpString "OpNop ; = %id"\n'
+            "%int = OpTypeInt 32 1\n"
+            "%pair = OpTypeStruct %int %int\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpNop\nOpReturn\nOpFunctionEnd\n"
+        )
+        mixed = (
+            "OpCapability Shader OpMemoryModel\r\nLogical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main" OpExecutionMode %main LocalSize 1 1 1\n'
+            '%file = OpString "OpNop ; = %id" %int\r=\nOpTypeInt 32 ; signedness follows\n1 '
+            "%pair = OpTypeStruct %int\n%int\n"
+            "%void = OpTypeVoid %fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None\n%fn %entry = OpLabel\n"
+            "OpNop OpReturn OpFunctionEnd\n"
+        )
+        assembled = spirv_asm.assemble(mixed)
+        self.assertEqual(assembled, spirv_asm.assemble(canonical))
+        _validate(assembled)
+
+    def test_prefixed_specialization_mnemonic_can_start_a_physical_line(self):
+        prefix = "%int = OpTypeInt 32 1\n%one = OpSpecConstant %int 1\n"
+        canonical = prefix + "%two = OpSpecConstantOp %int IAdd %one %one\nOpNop\n"
+        wrapped = prefix + "%two = OpSpecConstantOp %int\nOpIAdd %one\n%one OpNop\n"
+        self.assertEqual(spirv_asm.assemble(wrapped), spirv_asm.assemble(canonical))
+
+    def test_result_id_starts_instruction_on_its_physical_line(self):
+        text = '%str = OpString "first\r\nlast" %x\r=\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unknown opcode"):
+            spirv_asm.assemble(text)
+
+    def test_later_unterminated_literal_reports_its_physical_line(self):
+        text = '%str = OpString "first\rlast" %bad = OpString "unterminated'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unterminated string"):
+            spirv_asm.assemble(text)
+
     def test_reject_repeated_type_result_ids(self):
         declarations = (
             ("OpTypeInt 32 0", "OpTypeFloat 32"),
@@ -100,6 +184,7 @@ class SpirvAsmUnitTests(unittest.TestCase):
         for env, expected_ver in (
             ("vulkan1.0", 0x00010000),
             ("vulkan1.1", 0x00010300),
+            ("vulkan1.1spv1.4", 0x00010400),
             ("vulkan1.2", 0x00010500),
             ("vulkan1.3", 0x00010600),
         ):
@@ -533,6 +618,94 @@ class IntegerLiteralRangeTests(unittest.TestCase):
                     a = struct.unpack(f"<{len(got) // 4}I", got)
                     b = struct.unpack(f"<{len(ref) // 4}I", ref)
                     self.assertEqual(a[:2] + a[3:], b[:2] + b[3:])
+
+
+def _selector_module(sel_type, literal, later):
+    """A compute shader with an OpSwitch on `%sel = OpIAdd %sel_type %c0 %c0`.
+
+    `later` puts the block that defines `%sel` textually AFTER the block with the OpSwitch (the layout of SHADER-1089);
+    otherwise the definition comes first. spirv-as refuses the `later` layout ("The selector operand for OpSwitch must
+    be the result of an instruction that generates an integer scalar") and spirv-val refuses its block order ("Invalid
+    OpSwitch: selector id N has no type"): blocks must be laid out so that a block precedes every block it dominates.
+    """
+    head = (
+        "OpCapability Shader\nOpCapability Int64\nOpMemoryModel Logical GLSL450\n"
+        'OpEntryPoint GLCompute %main "main"\nOpExecutionMode %main LocalSize 1 1 1\n'
+        "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%uint = OpTypeInt 32 0\n%ulong = OpTypeInt 64 0\n"
+        f"%c0 = OpConstant %{sel_type} 0\n%main = OpFunction %void None %fn\n%entry = OpLabel\n"
+    )
+    define = f"%sel = OpIAdd %{sel_type} %c0 %c0\n"
+    switch = f"OpSelectionMerge %exit None\nOpSwitch %sel %exit {literal} %exit\n"
+    tail = "%exit = OpLabel\nOpReturn\nOpFunctionEnd\n"
+    if later:
+        return head + "OpBranch %dom\n%sw = OpLabel\n" + switch + "%dom = OpLabel\n" + define + "OpBranch %sw\n" + tail
+    return head + "OpBranch %dom\n%dom = OpLabel\n" + define + "OpBranch %sw\n%sw = OpLabel\n" + switch + tail
+
+
+def _switch_instruction(spv: bytes):
+    """The words of the (only) OpSwitch instruction, its header word first."""
+    words = struct.unpack(f"<{len(spv) // 4}I", spv)
+    i = 5
+    while i < len(words):
+        n = words[i] >> 16
+        if words[i] & 0xFFFF == 251:
+            return list(words[i:i + n])
+        i += n
+    raise AssertionError("no OpSwitch in the module")
+
+
+class SelectorMustBeDefinedBeforeTests(unittest.TestCase):
+    """SHADER-1089: an OpSwitch selector with no type yet is an error, not a silent 32-bit guess for the case literals."""
+
+    SELECTOR_ERROR = r"line \d+: OpSwitch selector %sel has no known type: it must be defined before the OpSwitch"
+
+    def test_repro_with_a_64_bit_selector_defined_in_a_later_block_is_refused(self):
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, self.SELECTOR_ERROR):    # was five words (0x500fb)
+            spirv_asm.assemble(_selector_module("ulong", "1", later=True))
+
+    def test_literal_above_32_bits_with_a_later_selector_gives_the_same_error(self):
+        for literal in ("0x100000001", "4294967296", "0xFFFFFFFFFFFFFFFF"):    # was an out-of-range error on a 32-bit guess
+            with self.subTest(literal=literal):
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, self.SELECTOR_ERROR):
+                    spirv_asm.assemble(_selector_module("ulong", literal, later=True))
+
+    def test_32_bit_selector_defined_later_is_refused_too(self):
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, self.SELECTOR_ERROR):    # was five words, silently
+            spirv_asm.assemble(_selector_module("uint", "1", later=True))
+
+    def test_selector_defined_nowhere_is_refused(self):
+        text = _selector_module("ulong", "1", later=False).replace("%sel = OpIAdd %ulong %c0 %c0\n", "")
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, self.SELECTOR_ERROR):
+            spirv_asm.assemble(text)
+
+    def test_the_error_names_the_line_of_the_switch(self):
+        text = _selector_module("ulong", "1", later=True)
+        switch_line = text.splitlines().index("OpSwitch %sel %exit 1 %exit") + 1
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, f"^line {switch_line}: OpSwitch selector %sel"):
+            spirv_asm.assemble(text)
+
+    def test_selector_defined_before_is_unchanged_and_valid(self):
+        for sel_type, literal, length in (("ulong", "1", 6), ("ulong", "0x100000001", 6), ("uint", "1", 5)):
+            with self.subTest(sel_type=sel_type, literal=literal):
+                spv = spirv_asm.assemble(_selector_module(sel_type, literal, later=False))
+                self.assertEqual(len(_switch_instruction(spv)), length)
+                _validate(spv)
+
+    def test_selector_that_is_a_function_parameter_or_phi_or_load_is_typed(self):
+        head = (
+            "OpCapability Shader\nOpCapability Int64\nOpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\nOpExecutionMode %main LocalSize 1 1 1\n'
+            "%void = OpTypeVoid\n%ulong = OpTypeInt 64 0\n%fnp = OpTypeFunction %void %ulong\n%fn = OpTypeFunction %void\n"
+            "%ptr = OpTypePointer Function %ulong\n%c0 = OpConstant %ulong 0\n"
+        )
+        param = (head + "%f = OpFunction %void None %fnp\n%p = OpFunctionParameter %ulong\n%e = OpLabel\n"
+                 "OpSelectionMerge %x None\nOpSwitch %p %x 0x100000001 %x\n%x = OpLabel\nOpReturn\nOpFunctionEnd\n"
+                 "%main = OpFunction %void None %fn\n%me = OpLabel\nOpReturn\nOpFunctionEnd\n")
+        self.assertEqual(len(_switch_instruction(spirv_asm.assemble(param))), 6)
+        load = (head + "%main = OpFunction %void None %fn\n%e = OpLabel\n%v = OpVariable %ptr Function\n"
+                "%sel = OpLoad %ulong %v\nOpSelectionMerge %x None\nOpSwitch %sel %x 0x100000001 %x\n"
+                "%x = OpLabel\nOpReturn\nOpFunctionEnd\n")
+        self.assertEqual(len(_switch_instruction(spirv_asm.assemble(load))), 6)
 
 
 if __name__ == "__main__":

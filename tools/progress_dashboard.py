@@ -1,7 +1,7 @@
 """Progress dashboard: what works, what changed and what blocks next, from outcomes the project already produces.
 
     python -I tools/progress_dashboard.py --out <folder outside the repository> [--work <work>] [--run-tests]
-                                          [--junit FILE ...] [--github] [--login NAME]
+                                          [--ctest-junit FILE] [--junit FILE ...] [--github] [--login NAME]
 
 Writes, into --out only (a folder inside the repository is refused, so nothing here can be committed by accident):
     progress.html                 one self-contained page (no network, no packages; open it from disk)
@@ -12,17 +12,19 @@ Writes, into --out only (a folder inside the repository is refused, so nothing h
 Sources, each optional and reported as missing rather than counted as zero when absent:
     unit tests      --run-tests runs tests/test_*.py the way CI selects them (standard-library files with a
                     __main__ block), one process each; the outcome and the commit it ran on are kept
-    ctest           runtime/build/Testing/Temporary/LastTest.log, and any --junit file (CTest or pytest flavour)
+    ctest           --ctest-junit selects the local CTest report (default: runtime/build/Testing/Temporary/LastTest.log).
+                    --junit adds independent CTest or pytest runs.
     gpu tests       --gpu-log: saved output of runtime/test/shaders/check.py, one panel group per GPU
     contract        the translator contract table in docs/design.md, by how each row says it was confirmed
     imports         the measured import tables in docs/runtime_imports.md
     corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
     github          --github, read-only through `gh`: every pull request into main (merged = implemented, open =
-                    partial), latest CI runs on main, the D3D- table of #313 checked against those merges, the
+                    partial), latest observed CI runs (--ci-branch, default main), an optional D3D- tracker checked against those merges, the
                     coordination issue's section sizes and, with --login, that account's claims and pull requests
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
 own document text; never a shader name, a carved file name or a path into the game copy.
+Usage: `python -I tools/progress_dashboard.py --help` lists the options.
 """
 import argparse
 import base64
@@ -41,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
@@ -48,7 +51,7 @@ LOGO = os.path.join(ROOT, "assets", "logo.png")
 SCHEMA = "leonida.progress/1"
 STATUSES = ("verified", "implemented", "partial", "failed", "missing", "blocked", "unknown")
 PYTEST_MARKERS = re.compile(r"^import pytest|^ *HAVE_NUMPY =", re.M)   # the CI selection rule (ci.yml)
-DEFAULT_REPO = "ItsNotRexed/Leonida"
+DEFAULT_REPO = "LeonidaReforge/Leonida"
 
 
 # ----------------------------------------------------------------------------------------------- helpers
@@ -277,7 +280,7 @@ def run_one_test(rel, timeout):
         return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
 
 
-CODE_DIRS = ("tools", "scripts")
+CODE_DIRS = ("tools", "scripts", "runtime/test/shaders")
 
 
 def file_digest(rel):
@@ -289,8 +292,7 @@ def file_digest(rel):
 
 
 def code_digest():
-    """One digest over the Python code the unit tests exercise: tools/, scripts/ and make_game.py (content, not
-    timestamps, so it does not depend on git or on whether the change is committed)."""
+    """Hash make_game.py and the Python files in CODE_DIRS by content, including uncommitted edits."""
     h = hashlib.sha256()
     rels = ["make_game.py"]
     for d in CODE_DIRS:
@@ -354,7 +356,8 @@ def collect_unit(col, out_dir, args):
     n = len(data["results"])
     col.metric("tests.passed", "tests", "Unit-test files passing (last run)", passed, n, "files whose last run exited 0 / files run")
     col.metric("tests.current", "tests", "Unit-test files passing on the current code", current, n,
-               "files that passed with no change since to themselves or to tools/, scripts/, make_game.py / files run")
+               "files that passed with no change since to themselves, make_game.py or Python files under "
+               + ", ".join(d + "/" for d in CODE_DIRS) + " / files run")
 
 
 def group_of_test(name):
@@ -448,25 +451,36 @@ def collect_ctest(col, args):
     seen = 0
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
-    if os.path.isfile(log):
+    reports = []
+    local_report = getattr(args, "ctest_junit", None)
+    if local_report:
+        reports.append(("ctest_junit", "ctest", local_report))
+    elif os.path.isfile(log):
         sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
         col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
     for path in args.junit or []:
+        if local_report and same_report_path(path, local_report):
+            continue
+        reports.append(("junit", "junit:" + os.path.basename(path), path))
+    for source_id, label, path in reports:
         if not os.path.isfile(path):
-            col.source("junit", path, "missing")
+            col.source(source_id, path, "missing")
             continue
         try:
-            root = ET.fromstring(read_utf8(path))
-        except ET.ParseError as e:
-            col.source("junit", path, "invalid", note=str(e))
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, LookupError, ValueError, OSError) as e:
+            col.source(source_id, path, "invalid", note=str(e))
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
         is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
+        if source_id == "ctest_junit" and not is_ctest:
+            col.source(source_id, path, "invalid", note="expected a CTest --output-junit report")
+            continue
         rows = parse_junit(root)
-        sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
-        col.source("junit", path, "ok", len(rows))
+        sets.append((label, path, rows, is_ctest))
+        col.source(source_id, path, "ok", len(rows))
     for label, path, rows, is_ctest in sets:
         ran = os.path.getmtime(path)
         for name, res, secs, detail in rows:
@@ -817,11 +831,99 @@ def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
              "items": item_ids(p.get("title")), "author": (p.get("author") or {}).get("login")} for p in latest]
 
 
-def collect_github(col, repo, login):
-    col.panel("d3d12", "D3D12 → Vulkan layer items (#313)", "D3D- items")
-    col.panel("ci", "CI on main", "workflows")
+CI_RUN_LIMIT = 40
+CI_WORKFLOW_LIMIT = 1000
+
+
+def ci_run_result(run):
+    """Dashboard status, precise CI state and next action; never turn missing evidence into a pass."""
+    status, conclusion = run.get("status"), run.get("conclusion")
+    if status == "action_required" or conclusion == "action_required":
+        return "blocked", "authorization_pending", "Maintainer: review the external workflow before authorizing it."
+    if status in ("queued", "requested", "waiting", "pending", "in_progress"):
+        return "unknown", "pending", "Wait for completion; inspect the run for queue, concurrency or approval blockers."
+    if status == "completed":
+        if conclusion == "success":
+            return "verified", "passed", "Inspect the linked run for its scope; this is not a verdict on all required checks."
+        if conclusion in ("failure", "timed_out", "startup_failure"):
+            return "failed", "failed", "Inspect failed jobs and steps in the linked run; preserve the failing gate."
+        if conclusion == "skipped":
+            return "unknown", "skipped", "Check workflow/job conditions and prerequisites; skipped is not tested."
+        if conclusion == "cancelled":
+            return "unknown", "cancelled", "Check cancellation or a superseding run; rerun only if still needed."
+        if conclusion == "neutral":
+            return "unknown", "neutral", "Inspect the run; a neutral result does not establish a passing check."
+    return "unknown", "unknown", "Inspect the run's status and conclusion; no pass or failure can be inferred."
+
+
+def collect_ci(col, repo, branch):
+    """Read metadata only. Run history is bounded; absence does not identify a trigger skip."""
+    col.panel("ci", f"CI on {branch}", "workflows")
+    runs = gh_json(["run", "list", "-R", repo, "--branch", branch, "--all", "--limit", str(CI_RUN_LIMIT),
+                    "--json", "workflowDatabaseId,workflowName,conclusion,status,headSha,createdAt,url,databaseId,attempt,event"])
+    workflows = gh_json(["workflow", "list", "-R", repo, "--all", "--limit", str(CI_WORKFLOW_LIMIT),
+                         "--json", "id,name,path,state"])
+    latest = {}
+    # Stable IDs keep renamed workflows together and equally named workflows separate.
+    for r in sorted(runs or [], key=lambda r: (r.get("createdAt") or "", r["databaseId"]), reverse=True):
+        latest.setdefault(r["workflowDatabaseId"], r)
+    inventory = {w["id"]: w for w in workflows or []}
+    col.source("github_ci", None, "invalid" if runs is None else "ok", len(latest),
+               note=f"Latest observed run per workflow on {branch}, within {CI_RUN_LIMIT} runs across all events. "
+                    + ("Run query failed: check gh authentication, read access and network."
+                       if runs is None else "Absence does not prove a skip or missing configuration; not a required-check verdict."))
+    col.source("github_ci_workflows", None, "invalid" if workflows is None else "ok", len(inventory),
+               note=("Workflow inventory query failed: check gh authentication, read access and network."
+                     if workflows is None else f"Repository-wide configuration, including disabled workflows; limit {CI_WORKFLOW_LIMIT}."
+                     + (" Limit reached; inventory may be incomplete." if len(workflows) >= CI_WORKFLOW_LIMIT else "")))
+    for wid in sorted(set(latest) | set(inventory)):
+        r, w = latest.get(wid), inventory.get(wid, {})
+        configuration = w.get("state")
+        disabled = configuration in ("disabled_manually", "disabled_inactivity", "disabled_fork", "deleted")
+        if r:
+            status, state, action = ci_run_result(r)
+            what = f"{state}: status={r.get('status') or 'unknown'}, conclusion={r.get('conclusion') or 'unknown'}"
+            what += f"; associated head {(r.get('headSha') or 'unknown')[:10]}; event={r.get('event') or 'unknown'}"
+        elif disabled:
+            status, state = "missing", "not_configured"
+            what = "not configured for execution"
+            action = "Maintainer: check whether this workflow should be enabled or restored."
+        elif runs is None:
+            status, state = "unknown", "source_unavailable"
+            what = "run evidence unavailable"
+            action = "Check gh authentication, read access and network; refresh the report."
+        elif configuration == "active":
+            status, state = "unknown", "not_observed"
+            what = f"no run observed on {branch} in the last {CI_RUN_LIMIT} runs"
+            action = "Check branch/path/event triggers and a wider run history; do not infer a skip."
+        else:
+            status, state = "unknown", "unknown"
+            what = "workflow configuration is unknown"
+            action = "Inspect repository Actions settings and workflow metadata."
+        if configuration:
+            what += f"; repository configuration={configuration}"
+            if r and disabled:
+                action += " Maintainer: also check whether this disabled workflow should be enabled or restored."
+        r = r or {}
+        col.add(f"ci.{wid}", "ci", "latest observed run per workflow", w.get("name") or r.get("workflowName") or str(wid),
+                status, detail=f"{what}. {action}", ci_state=state, action=action, configuration_state=configuration,
+                workflow_id=wid, workflow_path=w.get("path"), branch=branch, head_sha=r.get("headSha"),
+                run_id=r.get("databaseId"), run_attempt=r.get("attempt"), event=r.get("event"),
+                run_status=r.get("status"), conclusion=r.get("conclusion"), at=r.get("createdAt"), url=r.get("url"))
+    if not latest and not inventory:
+        unavailable = runs is None or workflows is None
+        state = "source_unavailable" if unavailable else "not_configured"
+        action = ("Check gh authentication, read access and network; refresh the report." if unavailable else
+                  "Maintainer: inspect Actions settings and expected workflow files; no workflows were returned.")
+        col.add("ci.inventory", "ci", "workflow configuration", "CI workflows", "unknown" if unavailable else "missing",
+                detail=f"{state}. {action}", ci_state=state, action=action, branch=branch)
+
+
+def collect_github(col, repo, login, d3d_issue=None, ci_branch='main'):
+    col.panel("d3d12", "D3D12 → Vulkan layer items", "D3D- items")
+    col.panel("ci", f"CI on {ci_branch}", "workflows")
     if not shutil.which("gh"):
-        col.source("github", None, "missing", note="gh is not installed")
+        col.source("github", None, "missing", note="gh is not installed; install GitHub CLI to read CI evidence")
         return {}
     summary = {"repo": repo}
     # every pull request into main, so a merge shows up on the next run even before a tracking table is edited
@@ -836,28 +938,12 @@ def collect_github(col, repo, login):
     else:
         summary["merged_latest"] = collect_pulls(col, repo, merged, open_prs)
         merged_set, open_set = {p["number"] for p in merged}, {p["number"] for p in open_prs}
-    runs = gh_json(["run", "list", "-R", repo, "--branch", "main", "--limit", "40",
-                    "--json", "workflowName,conclusion,status,headSha,createdAt,url"])
-    if runs is None:
-        col.source("github_ci", None, "invalid", note="gh run list failed (not logged in?)")
-    else:
-        latest, pending = {}, {}
-        for r in runs:      # newest first: the first completed run per workflow decides; a newer one still running is noted
-            if r["status"] == "completed":
-                latest.setdefault(r["workflowName"], r)
-            elif r["workflowName"] not in latest:
-                pending.setdefault(r["workflowName"], r)
-        for name in sorted(set(latest) | set(pending)):
-            r, newer = latest.get(name), pending.get(name)
-            if r is None:
-                status, what, r = "unknown", f"no completed run in the last 40; one {newer['status']}", newer
-            else:
-                status, what = ("verified" if r["conclusion"] == "success" else "failed"), r["conclusion"]
-            col.add(f"ci.{name}", "ci", "latest completed run per workflow", name, status,
-                    detail=f"{what} on {r['headSha'][:10]}" + (f"; a newer run is {newer['status']}" if newer and newer is not r else ""),
-                    at=r["createdAt"], url=r.get("url"))
-        col.source("github_ci", None, "ok", len(latest))
-    issue = gh_json(["issue", "view", "313", "-R", repo, "--json", "body,updatedAt"])
+    collect_ci(col, repo, ci_branch)
+    issue = gh_json(["issue", "view", str(d3d_issue), "-R", repo, "--json", "body,updatedAt"]) if d3d_issue else None
+    if not d3d_issue:
+        col.source("github_d3d_tracker", None, "skipped", note="no --d3d-issue supplied")
+    elif not issue:
+        col.source("github_d3d_tracker", None, "invalid", note=f"unable to read tracker #{d3d_issue}")
     if issue:
         n = 0
         table_ids, table_done = set(), set()
@@ -876,19 +962,19 @@ def collect_github(col, repo, login):
                 n += 1
                 col.add(f"d3d.{plain(row[0])}", "d3d12", why, f"{plain(row[0])} {plain(row[1])}"[:120], status,
                         detail=(st or why)[:200], owner=owner, prs=pr[:120])
-        col.source("github_313", None, "ok", n, note=f"issue updated {issue.get('updatedAt')}")
+        col.source("github_d3d_tracker", None, "ok", n, note=f"issue #{d3d_issue} updated {issue.get('updatedAt')}")
         if n:
             # the table lists only items still in progress; a merged item leaves it, so the merges are counted where they are recorded
             lists_read = merged_set is not None
             merged_ids = d3d_item_ids(merged) if lists_read else set()
             open_ids = d3d_item_ids(open_prs) if lists_read else set()
-            pr_done = (merged_ids - table_ids) - open_ids    # rows in #313 keep the table's state; the rest need a merged PR and no open one
+            pr_done = (merged_ids - table_ids) - open_ids    # tracker rows keep the table's state
             col.metric("d3d12.merged", "d3d12", "D3D- items merged on main" + ("" if lists_read else " (partial)"),
                        len(table_done | pr_done), len(table_ids | merged_ids | open_ids),
-                       "#313 rows whose state is implemented (d3d_state), plus D3D- IDs not in #313 that a merged PR title names "
-                       "and no open PR title names / all known D3D- IDs (#313 rows plus IDs named by any merged or open PR title)",
+                       "tracker rows whose state is implemented (d3d_state), plus D3D- IDs not in the tracker "
+                       "that a merged PR title names and no open PR title names / all known D3D- IDs",
                        note=None if lists_read else "partial: the merged or open PR list could not be read, "
-                                                     "so only the #313 rows are counted")
+                                                     "so only the tracker rows are counted")
     coord = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "Coordinating who works on what in:title",
                      "--json", "number,title,updatedAt"])
     if coord:
@@ -939,9 +1025,9 @@ def build(args, out_dir):
     collect_contract(col)
     collect_imports(col)
     collect_corpus(col, args.work)
-    gh = collect_github(col, args.repo, args.login) if args.github else {}
+    gh = collect_github(col, args.repo, args.login, args.d3d_issue, args.ci_branch or "main") if args.github else {}
     if not args.github:
-        col.source("github", None, "skipped", note="pass --github to read pull requests into main, CI, #313 and the coordination issue")
+        col.source("github", None, "skipped", note="pass --github to read pull requests into main, CI and project trackers")
     snap = {
         "schema": SCHEMA, "generated_at": iso(now_utc()), "git": g,
         "panels": [col.panels[k] for k in ("tests", "runtime", "gpu", "contract", "imports", "corpus", "merged", "d3d12", "ci") if k in col.panels],
@@ -998,13 +1084,28 @@ def main(argv=None):
     ap.add_argument("--tests", metavar="REGEX", help="with --run-tests, only the test files matching REGEX")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="test processes at a time")
     ap.add_argument("--test-timeout", type=int, default=300, help="seconds per test file")
-    ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
+    ap.add_argument("--ctest-junit", metavar="FILE", help="use the local CTest --output-junit report in place of LastTest.log")
+    ap.add_argument("--junit", nargs="*", metavar="FILE", help="additional independent CTest or pytest JUnit reports")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
                     help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
-    ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
+    ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs and project trackers through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
+    ap.add_argument("--ci-branch", help="with --github, CI branch to inspect (default main; PR panels still use main)")
+    ap.add_argument("--d3d-issue", type=int, help="optional D3D12 tracker issue number in --repo")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)
+    if args.ci_branch is not None and not args.github:
+        ap.error("--ci-branch requires --github")
+    if args.ci_branch is not None and not args.ci_branch.strip():
+        ap.error("--ci-branch must not be empty")
+    if args.login is not None and not args.github:
+        ap.error("--login requires --github")
+    if args.d3d_issue is not None and (args.d3d_issue < 1 or not args.github):
+        ap.error("--d3d-issue requires a positive issue number and --github")
+    if args.jobs < 1:
+        ap.error("--jobs must be a positive integer")
+    if args.test_timeout < 1:
+        ap.error("--test-timeout must be a positive integer")
     if args.run_tests and args.tests:
         try:
             args.tests = re.compile(args.tests)
@@ -1021,7 +1122,14 @@ def main(argv=None):
         args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
         if args.tests and not args.test_files:
             ap.error("--tests did not match any test files")
-    os.makedirs(out_dir, exist_ok=True)
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        print(f"--out {args.out} is not a directory", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"--out {args.out}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     try:
         snap = build(args, out_dir)
     except OSError as exc:

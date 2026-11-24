@@ -2,7 +2,7 @@
 
 # دليل البدء السريع لمشروع Leonida
 
-الوثائق الإنجليزية هي المرجع المعتمد. يستند هذا الدليل إلى المراجعة `ec8ec4c9` ويغطي خطوات البدء الأساسية.
+الوثائق الإنجليزية هي المرجع المعتمد. يستند هذا الدليل إلى المراجعة `561b65a` ويغطي خطوات البدء الأساسية.
 راجع [ملف README بالإنجليزية](../../../README.md#project-status) لمعرفة حالة المشروع الحالية، و[فهرس الوثائق](../../README.md) للمزيد من التفاصيل.
 
 ## ما هو Leonida؟
@@ -17,13 +17,14 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 ## المتطلبات
 
 - نسختك الخاصة من حزمة Xbox Series بالإصدار `1.0.2.1`. اختر المجلد الذي يحتوي على `MicrosoftGame.Config` وأرشيفات `.rpf`.
-- Windows 10 أو 11 بمعمارية x64، مع نحو 350 غيغابايت متاحة لملفات العمل. يمكن وضعها على قرص آخر باستخدام `--work`.
+- Windows 10 أو 11 بمعمارية x64، مع نحو 400 غيغابايت متاحة لملفات العمل. هذا الرقم للبناء الكامل: التشغيل وحده يكفيه `--stages check,shaders,runtime` بنحو 30 غيغابايت، ومرحلة `assets` وحدها تطلب نحو 370 غيغابايت. يمكن وضعها على قرص آخر باستخدام `--work` و`--out`.
 - Git و[Python 3.12 أو أحدث](https://www.python.org/downloads/) و[حزمة .NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
   عند تثبيت Python على Windows، اختر إضافة `python.exe` إلى `PATH`.
 - [حزمة Vulkan SDK](https://vulkan.lunarg.com/) لتوفير `spirv-as` و`spirv-val` و`vulkaninfo`.
 - [LLVM 21 أو أحدث](https://github.com/llvm/llvm-project/releases) مع دعم AMDGPU في `llvm-mc`.
   نسخة LLVM الرسمية لـWindows لا تتضمن هذا الدعم. من جذر المستودع، شغّل `scripts/build_llvm_mc.ps1` من PowerShell لبناء `llvm-mc.exe`.
   يتطلب السكربت Git وأدوات C++ في Visual Studio ويضبط `LLVM_MC`. افتح نافذة PowerShell جديدة بعد انتهائه.
+  إذا كنت تستخدم [conda](https://docs.conda.io/)، فطريقة أسرع هي `conda install -c conda-forge llvm-tools` (نسخة Windows منه تتضمن هدف AMDGPU؛ استخدم [دليل الاختبارات](../../testing.md) الإصدار 23.1.6)، ثم اضبط `LLVM_MC` على المسار الكامل لملف `llvm-mc.exe` الذي يثبّته (يعرض `where.exe llvm-mc` مساره بعد تنشيط البيئة؛ أما `where` المجرد في PowerShell فهو `Where-Object`).
   إذا ثبّتَّ `llvm-21` على Ubuntu داخل WSL، اضبط `LLVM_MC` في نافذة PowerShell التي ستشغّل منها البناء.
 
   ```powershell
@@ -38,7 +39,7 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 بعد تثبيت المتطلبات، استنسخ المستودع مع وحدته الفرعية.
 
 ```powershell
-git clone --recursive https://github.com/ItsNotRexed/Leonida
+git clone --recursive https://github.com/LeonidaReforge/Leonida.git
 cd Leonida
 ```
 
@@ -53,6 +54,7 @@ cd Leonida
 
 ```powershell
 python -I make_game.py --find
+python -I make_game.py --pick
 python -I make_game.py --check
 python -I make_game.py --check --full-check
 python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
@@ -80,15 +82,7 @@ python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --wo
 
 ## المساهمة
 
-1. اقرأ [دليل المساهمة](../../../CONTRIBUTING.md) وراجع [مسألة التنسيق][coord] وطلبات الدمج المفتوحة قبل البدء.
-2. احجز المهمة بتعليق `claiming: <ID>` في مسألة التنسيق، أو اكتب وصفًا من سطر واحد إن لم يكن لها معرّف بعد.
-3. شغّل الاختبارات المناسبة بمدخلات اصطناعية. لتعديلات التوثيق مثلًا، يمكن تشغيل `python -I tests/test_docs_links.py` من جذر المستودع.
-4. في طلب الدمج، اذكر معرّف المهمة أو رابط الحجز والاختبارات التي شغّلتها. اذكر البطاقة الرسومية وإصدار تعريفها إذا اختبرت على GPU،
-   واذكر أي مساعدة من الذكاء الاصطناعي.
-
-يوضح [دليل اختبارات GPU](../../testing.md) طريقة تشغيل الاختبارات من دون ملفات اللعبة.
-يمكن نشر النتائج في [مسألة الاختبارات رقم 166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).
+For documentation changes, run `python -I tests/test_docs_links.py` from the repository root.
 
 </div>
