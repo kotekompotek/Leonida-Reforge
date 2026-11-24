@@ -20,7 +20,14 @@ SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    """A Bink 2 stream bink_index will accept: the header shape of tests/test_bink_index.py, with the
+    sentinel after it so the source is still recognisable as the file the tool must not replace.
+
+    bink_index checks a single named file's header before it indexes it (target_problem), because a wrong path
+    or a mislabelled file used to come back as a successful scan of 0 streams. The plain sentinel is neither a
+    KB2 stream nor an RPF archive, so the tool was right to refuse it: the fixture is what was wrong.
+    """
+    return struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):

@@ -426,8 +426,26 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(rep["gs"]["rbw_vgpr_counts"], {"v0": 1, "v1": 1})
             self.assertEqual(rep["gs"]["s3_rbw_op_patterns"], {"s_bfe_u32 D, s3, 0x80008": 1})
 
+    def test_buffer_load_lds_reads_vaddr_and_writes_no_vgpr(self):
+        # The lds modifier sends the load straight to LDS: args[0] is vaddr (a source), not a destination.
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tbuffer_load_dword v0, s[0:3], s4 offen lds",
+            "\tv_mov_b32 v7, v0",
+        )]
+        s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
+        self.assertIn(0, v_rbw)          # vaddr read before write, as the repro requires
+
+    def test_dot_accumulate_ops_read_their_destination(self):
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\tv_dot2c_f32_f16 v2, v3, v4",
+            "\tv_dot4c_i32_i8 v5, v3, v4",
+        )]
+        _s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
+        self.assertEqual(v_rbw, [2, 3, 4, 5])
+
 
 def setUpModule():
+
     # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
     quiet = contextlib.redirect_stdout(io.StringIO())
     quiet.__enter__()

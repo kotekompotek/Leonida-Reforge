@@ -22,8 +22,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
-# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
-FOREIGN = {"--search", "--state", "--index-url", "--help"}
+# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
+# the spirv-opt passes docs/embedded_shaders.md tried on one module.
+FOREIGN = {"--search", "--state", "--index-url", "--help",
+           "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
+           "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
@@ -41,7 +44,7 @@ def tracked_files():
     except (OSError, subprocess.CalledProcessError):
         found = []
         for root, dirs, files in os.walk(ROOT):
-            dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules")]
+            dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules", ".pytest_cache")]
             found += [os.path.relpath(os.path.join(root, f), ROOT).replace(os.sep, "/") for f in files]
         return found
 
@@ -156,6 +159,13 @@ def fenced_commands(text):
     return out
 
 
+# These dev.py subcommands pass their arguments through to the producer.
+DEV_PRODUCERS = {
+    "boot-trace": "tools/boot_trace.py",
+    "guest-scene": "scripts/run_guest_scene.py",
+}
+
+
 def tool_flag_mismatches(pages, sources):
     """[(page:line, tool, flag)] for fenced commands running one tool with a flag its source lacks.
     `sources` maps a tool path to its text."""
@@ -166,10 +176,14 @@ def tool_flag_mismatches(pages, sources):
             if not m or m.group(1) not in sources:
                 continue
             tool = m.group(1)
-            if '"--" +' in sources[tool] or "'--' +" in sources[tool]:
+            args = cmd[m.end():].split(maxsplit=1)
+            if tool == "scripts/dev.py" and args:
+                tool = DEV_PRODUCERS.get(args[0], tool)
+            source = sources.get(tool, "")
+            if '"--" +' in source or "'--' +" in source:
                 continue
             for flag in sorted(set(FLAG.findall(cmd))):
-                if flag not in FOREIGN and flag not in sources[tool]:
+                if flag not in FOREIGN and flag not in source:
                     out.append((f"{page}:{n}", tool, flag))
     return out
 
@@ -198,6 +212,23 @@ def ps1_flag_mismatches(pages, sources):
 
 
 class DocsCliFlags(unittest.TestCase):
+    def test_dev_inherits_only_the_selected_producer_flags(self):
+        pages = {"docs/dev.md": ("```\n"
+                                 "python -I scripts/dev.py boot-trace --d3d12 --negative-controls\n"
+                                 "python -I scripts/dev.py guest-scene --negative-controls --d3d12\n"
+                                 "python -I scripts/dev.py discover --json --d3d12\n"
+                                 "```\n")}
+        sources = {
+            "scripts/dev.py": "--json",
+            "tools/boot_trace.py": "--d3d12",
+            "scripts/run_guest_scene.py": "--negative-controls",
+        }
+        self.assertEqual(tool_flag_mismatches(pages, sources), [
+            ("docs/dev.md:2", "tools/boot_trace.py", "--negative-controls"),
+            ("docs/dev.md:3", "scripts/run_guest_scene.py", "--d3d12"),
+            ("docs/dev.md:4", "scripts/dev.py", "--d3d12"),
+        ])
+
     def test_checkers_report_only_the_missing_flag(self):
         pages = {"docs/a.md": "Use `--real` or `--gone`, and `gh --search`.\n"
                               "```\npython -I tools/x.py --real --old \\\n    --more\npython -I tools/y.py --old\n```\n"}

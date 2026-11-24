@@ -1,9 +1,11 @@
 // mods.h: mod.json manifests and archetype swaps (docs/modding.md). No game files.
 #include "../src/mods.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 namespace {
@@ -23,6 +25,24 @@ void write(const std::filesystem::path& p, const std::string& text) {
     std::ofstream(p, std::ios::binary) << text;
 }
 
+// The mod contract (docs/modding.md, "Name hashes"): joaat hashes the bytes mod.json holds (UTF-8) and lower-cases
+// ASCII A-Z only. Synthetic names. Each hash was computed from the folded bytes with a separate one-at-a-time
+// implementation, not with joaat. tests/test_joaat_agreement.py has the same table and fails when the two differ.
+struct JoaatVector {
+    const char* name;    // UTF-8, as written in mod.json
+    const char* folded;  // the bytes joaat hashes: A-Z lower-cased, every other byte unchanged
+    uint32_t hash;
+};
+constexpr JoaatVector kModJoaatVectors[] = {
+    {"plain_name", "plain_name", 0x0C082AF0u},
+    {"Mixed_CASE_09", "mixed_case_09", 0x0A605979u},
+    {"caf\xC3\xA9", "caf\xC3\xA9", 0x9096ADF2u},                               // café: é is two bytes
+    {"CAF\xC3\x89", "caf\xC3\x89", 0xC7E69C9Du},                               // CAFÉ: É is not folded
+    {"\xCE\xA9mega", "\xCE\xA9mega", 0xFDCD0371u},                             // Ωmega: outside Latin-1
+    {"\xE5\x90\x8D\xE5\x89\x8D", "\xE5\x90\x8D\xE5\x89\x8D", 0xA395EABDu},  // 名前: CJK
+    {"smile_\xF0\x9F\x98\x80", "smile_\xF0\x9F\x98\x80", 0x7F0B2EDEu},     // smile_ + U+1F600 as UTF-8, no escape
+};
+
 }  // namespace
 
 int main() {
@@ -33,6 +53,13 @@ int main() {
     static_assert(joaat("cs_mandy") == 0xD7C0CDFFu, "cs_mandy's model id");
     static_assert(joaat("mandy") == 0x03A885E6u, "Mandy's PERSCHARS name hash");
     static_assert(joaat("CS_Mandy") == joaat("cs_mandy"), "joaat lower-cases");
+
+    for (std::size_t i = 0; i < std::size(kModJoaatVectors); ++i) {
+        const JoaatVector& v = kModJoaatVectors[i];
+        const std::string row = "mod-contract vector " + std::to_string(i) + ": ";
+        check(joaat(v.name) == v.hash, (row + "joaat(name) is the listed hash").c_str());
+        check(joaat(v.folded) == v.hash, (row + "joaat(folded bytes) is the listed hash").c_str());
+    }
 
     uint32_t id = 0;
     check(parse_model_id("0xD7C0CDFF", id) && id == 0xD7C0CDFFu, "a 0x hash is taken as it is");
@@ -86,6 +113,25 @@ int main() {
               error == "mod.json is not a JSON object",
           "an empty or one-byte manifest is not mistaken for UTF-16");
 
+    // KNOWN LIMITATION, recorded here, not the intended behaviour (docs/modding.md, "Name hashes"). The JSON reader
+    // writes each half of an escaped surrogate pair as its own three-byte sequence (CESU-8): U+1F600 escaped as the
+    // pair D83D DE00 is read as ED A0 BD ED B8 80, not as its UTF-8 bytes F0 9F 98 80 (the last vector), which is what
+    // Python's json and tools/leonida_mods.py hash. Changing the reader is a separate proposal; until then no
+    // end-to-end parity is claimed for supplementary characters.
+    leonida::Json escaped;
+    check(leonida::JsonReader("\"smile_\\ud83d\\ude00\"").parse(escaped) &&
+              escaped.string == "smile_\xED\xA0\xBD\xED\xB8\x80",
+          "limitation: an escaped surrogate pair is read as two three-byte sequences");
+    check(parse_mod("{\"archetype_swaps\":[{\"from\":\"smile_\\ud83d\\ude00\",\"to\":\"plain_name\"}]}", "m", mod,
+                    error) &&
+              mod.archetype_swaps.size() == 1 && mod.archetype_swaps[0].from == 0x579A5A35u &&
+              mod.archetype_swaps[0].from != 0x7F0B2EDEu,
+          "limitation: an escaped supplementary character does not hash as its UTF-8 bytes");
+    check(parse_mod("{\"archetype_swaps\":[{\"from\":\"smile_\xF0\x9F\x98\x80\",\"to\":\"plain_name\"}]}", "m", mod,
+                    error) &&
+              mod.archetype_swaps.size() == 1 && mod.archetype_swaps[0].from == 0x7F0B2EDEu,
+          "the reader passes the UTF-8 bytes of an unescaped supplementary character through unchanged");
+
     // "camera": first-person view (docs/modding.md, "First-person view")
     check(parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":4,"contexts":[0]}})", "fp", mod,
                     error) && mod.camera.set && mod.camera.first_person && mod.camera.first_person_value == 4 &&
@@ -133,8 +179,8 @@ int main() {
     set_active_camera(camera_of({}));
     check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
 
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
-    std::filesystem::remove_all(dir);
+    const testfiles::ScratchDir scratch("leonida_mods_test");
+    const auto& dir = scratch.path();
     write(dir / "a_mandy" / "mod.json",
           R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy","when":"always"}]})");
     write(dir / "b_off" / "mod.json",
@@ -156,7 +202,6 @@ int main() {
     check(mandy_only.remap(0xE472B687u) == 0xD7C0CDFFu, "the Mandy mod swaps Lucia's player model for cs_mandy");
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
-    std::filesystem::remove_all(dir);
 
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -36,7 +36,7 @@ Windows. Процессор консоли x86-64, как у ПК, поэтом�
 - **AMD RDNA1 (RX 5000)**: поддерживаемая цель, близкая к RDNA2 консоли; её подгруппы шириной 64 выполняют
   шейдеры wave64 нативно.
 
-Результаты GPU со всех платформ собираются в [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+See the [GPU testing guide](../../testing.md) for current reporting instructions.
 
 ## Что нужно
 
@@ -77,7 +77,7 @@ Windows. Процессор консоли x86-64, как у ПК, поэтом�
 1. Установите всё из списка выше.
 2. Склонируйте проект **вместе с подмодулем**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
    Кнопка «Download ZIP» на GitHub оставляет за бортом `third_party/rpf9-explorer`. Сборка подтянет его сама,
    если установлен `git`, иначе скажет, что сделать.
@@ -184,15 +184,4 @@ Windows этот же флаг пропускает сборку.
 
 ## Как помочь и прогнать тесты на видеокарте
 
-1. Посмотрите открытые pull request и [issue координации][coord], чтобы не делать ту же работу дважды. Заявите
-   задачу строкой `claiming: <ID>` или одним предложением описания, если ID ещё нет.
-2. Прогоните нужные тесты на синтетических входных данных. Например, проверку манифеста:
-   `python -I tests/test_manifest_verifier.py` из корня репозитория.
-3. В pull request укажите ID задачи и то, что вы проверили, а если запускали тесты на видеокарте, ещё её модель и
-   версию драйвера. Отметьте, помогал ли вам ИИ. Все правила в [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
-
-[Руководство по тестам на видеокарте](../../testing.md) объясняет, как обойтись без файлов игры. Результаты
-складывают в [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), по одному комментарию на карту и
-драйвер.
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).

@@ -35,6 +35,7 @@ synthetic. The encrypted RPF9 table of contents is still the reason an archive p
 mapped to a carved document; those targets remain target nodes rather than invented document
 edges. This is a mount/reference graph, not a full runtime schema: the catalog carries names and
 categories, not field types.
+Usage: `python -I tools/gamedata_graph.py --help` lists the options.
 """
 import argparse
 import json

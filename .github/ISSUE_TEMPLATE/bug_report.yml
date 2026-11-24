@@ -6,9 +6,10 @@ body:
     attributes:
       value: |
         Search open and closed issues for the error text first, and comment there if it is already reported.
-        **Never attach game files**, extracted assets or generated shaders (DXBC, FSSM, disassembly, SPIR-V), and
-        don't paste more than a few lines of them. Only version 1.0.2.1 of your own Xbox Series package is
-        supported; issues about obtaining the game are closed.
+        **Never attach or quote game files**, extracted assets or generated shaders (DXBC, FSSM, disassembly,
+        SPIR-V). Remove local paths, credentials, personal data and game-derived content from logs. Only
+        version 1.0.2.1 of your own Xbox Series package is supported; do not ask how to obtain the game.
+        For vulnerabilities, see the security policy rather than filing a public issue.
   - type: input
     id: summary
     attributes:
@@ -57,7 +58,7 @@ body:
     id: output
     attributes:
       label: Output
-      description: The last lines the console printed, from the stage that failed down to the error.
+      description: Sanitized console output for the failing stage, with game-derived content and local paths removed.
       render: text
     validations:
       required: true

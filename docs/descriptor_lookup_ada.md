@@ -39,7 +39,7 @@ Unlike the [M3 Max run](descriptor_lookup_apple.md), this run kept the benchmark
 From a Leonida checkout on Windows, with Visual Studio 2022 (C++ desktop workload, C++ CMake tools) and the Vulkan SDK installed:
 
 ```powershell
-git fetch https://github.com/ItsNotRexed/Leonida.git dcd8ecf10b138566d567020562b7afd853a89024
+git fetch https://github.com/LeonidaReforge/Leonida.git dcd8ecf10b138566d567020562b7afd853a89024
 git worktree add --detach ..\leonida-ada FETCH_HEAD
 cd ..\leonida-ada
 powershell -ExecutionPolicy Bypass -File scripts\build_runtime.ps1

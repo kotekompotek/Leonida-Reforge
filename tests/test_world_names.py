@@ -38,15 +38,17 @@ class ManifestEnumerationTest(unittest.TestCase):
             with open(names, "w", encoding="utf-8", newline="\n") as f:
                 f.write("synthetic_model\n")
 
+            walk_error = PermissionError(13, "Permission denied", blocked)
+
             def walk(root, onerror=None):
                 if onerror:
-                    onerror(PermissionError(13, "Permission denied", blocked))
+                    onerror(walk_error)
                 return iter(())
 
             with mock.patch.object(WN.os, "walk", walk), contextlib.redirect_stderr(io.StringIO()) as err, \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(WN.main(["build", "--manifest", manifests, "--names", names, "--out", output]), 1)
-            self.assertIn(blocked, err.getvalue())
+            self.assertIn(str(walk_error), err.getvalue())
             with open(output, "rb") as f:
                 self.assertEqual(f.read(), b"existing dictionary")
 
@@ -330,6 +332,23 @@ class CliTest(unittest.TestCase):
                 names = json.load(handle)["names"]
             self.assertEqual(names, {WN.joaat_hex(name): [name]
                                      for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
+
+    def test_xml_names_require_matching_end_tags_in_fragments(self):
+        fragment = (
+            b"<name>WrongElement</other><Name>WrongCase</name>"
+            b"<a:name>WrongPrefix</b:name><name>Unclosed"
+            b"<name>GoodOne</name ><a:Name>GoodTwo</a:Name\r\n>"
+            b"<locationName>GoodThree</locationName>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "fragment.xml")
+            with open(xml, "wb") as handle:
+                handle.write(fragment)
+            dictionary = WN.NameDictionary()
+            self.assertEqual(dictionary.add_xml(xml), 3)
+            names = dictionary.to_json()["names"]
+        self.assertEqual(sorted(name for group in names.values() for name in group),
+                         ["GoodOne", "GoodThree", "GoodTwo"])
 
     def test_resolve_rejects_a_malformed_dictionary(self):
         with tempfile.TemporaryDirectory() as tmp:

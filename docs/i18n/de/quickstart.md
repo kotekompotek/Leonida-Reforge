@@ -39,8 +39,7 @@ Auf keiner Plattform ist bisher etwas spielbar. Was heute wo läuft:
 - **AMD RDNA1 (RX 5000)**: ein unterstütztes Ziel, nah am RDNA2 der Konsole; seine 64 breiten Subgroups führen die
   Wave64-Shader nativ aus.
 
-GPU-Ergebnisse von allen Plattformen werden in [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166)
-gesammelt.
+See the [GPU testing guide](../../testing.md) for current reporting instructions.
 
 ## Voraussetzungen
 
@@ -59,7 +58,8 @@ gesammelt.
     dauert etwa 20-40 Minuten.
   - Schneller, wenn du [conda](https://docs.conda.io/) nutzt: `conda install -c conda-forge llvm-tools` (der
     Windows-Build enthält das AMDGPU-Target), dann `LLVM_MC` auf den vollen Pfad des installierten `llvm-mc.exe`
-    setzen (`where llvm-mc` zeigt ihn bei aktivierter Umgebung).
+    setzen (`where.exe llvm-mc` zeigt ihn bei aktivierter Umgebung; das nackte `where` ist in
+    PowerShell das Cmdlet `Where-Object`).
   - Mit WSL: `llvm-21` in Ubuntu installieren und die Variable in derselben PowerShell-Sitzung setzen, in der du
     `make_game.py` startest:
 
@@ -81,7 +81,7 @@ gesammelt.
 1. Installiere die Voraussetzungen oben.
 2. Klone das Repository **mit seinem Submodul**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
    Ein „Download ZIP“ von GitHub lässt `third_party/rpf9-explorer` weg. Der Build holt es nach, wenn `git`
    installiert ist, und sagt dir sonst, was zu tun ist.
@@ -161,16 +161,4 @@ GPU der Runtime es kann, denn dieser Treiber kann bei emuliertem LDS-Code abstü
 
 ## Mithelfen und GPU-Tests ausführen
 
-1. Schau dir die offenen Pull Requests und das [Koordinations-Issue][coord] an, damit keine Arbeit doppelt gemacht
-   wird. Reserviere eine Aufgabe dort mit `claiming: <ID>` oder mit einer kurzen Beschreibung, wenn sie noch keine ID
-   hat.
-2. Führe die passenden Tests mit synthetischen Eingaben aus, zum Beispiel den Manifest-Prüfer mit
-   `python -I tests/test_manifest_verifier.py` im Hauptordner des Repositorys.
-3. Nenne im Pull Request die Aufgaben-ID, beschreibe, was du getestet hast, und bei GPU-Tests die Grafikkarte und die
-   Treiberversion. Gib an, ob du KI-Unterstützung genutzt hast. Die Regeln stehen in
-   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
-
-Die [Anleitung zu den GPU-Tests](../../testing.md) zeigt, wie sie ohne Spieldateien laufen.
-Ergebnisse von GPU-Tests gehören in [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).

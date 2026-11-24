@@ -64,7 +64,7 @@ o estágio parecer concluído com zero shaders, e um link simbólico em `disasm`
 1. Instale os pré-requisitos acima.
 2. Clone o repositório **com o submódulo**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
 3. Abra a pasta `Leonida` e dê duplo clique em **`Build.bat`**.
 
@@ -72,8 +72,8 @@ O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Gam
 discos até dois níveis), valida os pré-requisitos e o espaço livre e grava o resultado em `Documents\Leonida`.
 Se o build for interrompido, basta rodar novamente para retomar de onde parou.
 
-**Espaço em disco baixo:** o valor de ~350 GB é para o build completo. Para *rodar* o port, `--stages check,shaders,runtime`
-precisa de cerca de 30 GB; o estágio `assets` (~300 GB) é apenas para as ferramentas de assets, e `--wav` adiciona
+**Espaço em disco baixo:** o valor de ~400 GB é para o build completo. Para *rodar* o port, `--stages check,shaders,runtime`
+precisa de cerca de 30 GB; o estágio `assets` (~370 GB) é apenas para as ferramentas de assets, e `--wav` adiciona
 várias vezes o tamanho do Ogg Opus. `--work` e `--out` podem ficar em outro disco; uma unidade de pacote somente leitura
 precisa de `--overlay` em uma gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm` no lugar: apagá-los
 mantendo a pasta faz o estágio parecer concluído com zero shaders, e um `disasm` com symlink é recusado.
@@ -111,7 +111,7 @@ o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro 
 somente leitura, passe `--overlay` ao iniciar o runtime e aponte para uma pasta em um disco gravável.
 - **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
 - **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
-- **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+- **`--work`**: recomenda-se apontar para um disco com pelo menos 400 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 - **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
 
 ### Diagnóstico do Vulkan no Linux
@@ -159,15 +159,4 @@ da instalação. No Windows, `--runtime-build` também permite reutilizar um bui
 
 ## Como contribuir e rodar os testes de GPU
 
-1. Consulte os PRs abertos e a [issue de coordenação][coord] para evitar trabalho duplicado. Reserve a
-   tarefa com `claiming: <ID>` ou com uma descrição de uma linha, se ainda não houver ID.
-2. Rode os testes relevantes com entradas sintéticas. Por exemplo, para testar o verificador de manifestos,
-   execute `python -I tests/test_manifest_verifier.py` na raiz do repositório.
-3. No PR, inclua o ID da tarefa, descreva o que testou e informe a GPU e o driver se rodou testes de GPU.
-   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se usou assistência de IA, indique
-   isso no PR, conforme [`AGENTS.md`](../../../AGENTS.md).
-
-O [guia de testes em GPU](../../testing.md) mostra como executar os testes sem arquivos do jogo.
-Publique os resultados de GPU na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).

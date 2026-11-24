@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -98,6 +99,42 @@ class PythonAssemblerTests(unittest.TestCase):
                 rc = run_gpu_tests.main()
             self.assertEqual(rc, 2)
             self.assertIn("--disasm-dir is not a directory", err.getvalue())
+
+    def test_run_suite_reuses_existing_work_listings(self) -> None:
+        listing = b"; synthetic\n\ts_endpgm\n"
+        run_command = run_gpu_tests.run_cmd
+        for placement in ("in-place", "hard-link", "separate"):
+            with self.subTest(placement=placement), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "work"
+                working = work / "disasm" / "cs_lds.s"
+                working.parent.mkdir(parents=True)
+                source = working if placement == "in-place" else Path(tmp) / "source" / working.name
+                source.parent.mkdir(exist_ok=True)
+                source.write_bytes(listing)
+                if placement == "hard-link":
+                    try:
+                        os.link(source, working)
+                    except OSError as exc:
+                        self.skipTest(f"hard links unavailable: {exc}")
+
+                args = SimpleNamespace(assembler="python", no_validate=True, disasm_dir=str(source.parent),
+                                       filter="cs_lds", build=str(work), require_pass=True)
+
+                def run(command, env=None, gpu=True):
+                    if not gpu:
+                        selected = Path(command[3])
+                        self.assertNotEqual(selected, working.parent)
+                        self.assertEqual((selected / working.name).read_bytes(), listing)
+                        return run_command(command, env=env, gpu=False)
+                    self.assertTrue(Path(command[1]).is_file())
+                    return 0, "synthetic GPU result"
+
+                with (patch.object(run_gpu_tests, "run_cmd", side_effect=run) as launches,
+                      patch.object(sys, "stdout", io.StringIO())):
+                    self.assertEqual(run_gpu_tests.run_suite(args, str(work)), 0)
+                self.assertEqual(launches.call_count, 2)
+                self.assertEqual(source.read_bytes(), listing)
+                self.assertEqual(working.read_bytes(), listing)
 
 
 if __name__ == "__main__":

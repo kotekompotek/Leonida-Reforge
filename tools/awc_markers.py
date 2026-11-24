@@ -21,6 +21,7 @@ with the length of its own stream in 48 kHz frames: for streamed music the descr
 packet), otherwise the Opus format tag (samples / channels). Streams with neither have no length and are counted.
 
 The report holds counts, sizes, 32-bit hashes and numeric ranges only.
+Usage: `python -I tools/awc_markers.py --help` lists the options.
 """
 import argparse
 import json

@@ -39,7 +39,7 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 بعد تثبيت المتطلبات، استنسخ المستودع مع وحدته الفرعية.
 
 ```powershell
-git clone --recursive https://github.com/ItsNotRexed/Leonida
+git clone --recursive https://github.com/LeonidaReforge/Leonida.git
 cd Leonida
 ```
 
@@ -82,15 +82,7 @@ python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --wo
 
 ## المساهمة
 
-1. اقرأ [دليل المساهمة](../../../CONTRIBUTING.md) وراجع [مسألة التنسيق][coord] وطلبات الدمج المفتوحة قبل البدء.
-2. احجز المهمة بتعليق `claiming: <ID>` في مسألة التنسيق، أو اكتب وصفًا من سطر واحد إن لم يكن لها معرّف بعد.
-3. شغّل الاختبارات المناسبة بمدخلات اصطناعية. لتعديلات التوثيق مثلًا، يمكن تشغيل `python -I tests/test_docs_links.py` من جذر المستودع.
-4. في طلب الدمج، اذكر معرّف المهمة أو رابط الحجز والاختبارات التي شغّلتها. اذكر البطاقة الرسومية وإصدار تعريفها إذا اختبرت على GPU،
-   واذكر أي مساعدة من الذكاء الاصطناعي.
-
-يوضح [دليل اختبارات GPU](../../testing.md) طريقة تشغيل الاختبارات من دون ملفات اللعبة.
-يمكن نشر النتائج في [مسألة الاختبارات رقم 166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).
+For documentation changes, run `python -I tests/test_docs_links.py` from the repository root.
 
 </div>

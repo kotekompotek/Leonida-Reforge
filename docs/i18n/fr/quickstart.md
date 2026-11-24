@@ -37,8 +37,7 @@ Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
 - **AMD RDNA1 (RX 5000)** : une cible prise en charge, proche du RDNA2 de la console ; ses sous-groupes de 64
   exécutent les shaders wave64 nativement.
 
-Les résultats GPU de toutes les plateformes sont regroupés dans
-l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+See the [GPU testing guide](../../testing.md) for current reporting instructions.
 
 ## Prérequis
 
@@ -57,7 +56,8 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
     20 à 40 minutes.
   - Plus rapide si vous utilisez [conda](https://docs.conda.io/) : `conda install -c conda-forge llvm-tools` (sa
     version Windows inclut la cible AMDGPU), puis faites pointer `LLVM_MC` vers le chemin complet du `llvm-mc.exe`
-    installé (`where llvm-mc` l'affiche une fois l'environnement activé).
+    installé (`where.exe llvm-mc` l'affiche une fois l'environnement activé ; le `where` seul est
+    l'alias `Where-Object` de PowerShell).
   - Avec WSL, installez `llvm-21` dans Ubuntu et donnez la commande entière à `LLVM_MC`, dans la session PowerShell
     où vous lancerez `make_game.py` :
 
@@ -79,7 +79,7 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 1. Installez les prérequis ci-dessus.
 2. Clonez le dépôt **avec son sous-module** :
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
    Un « Download ZIP » depuis GitHub n'inclut pas `third_party/rpf9-explorer` : la compilation le récupère si `git`
    est installé, et sinon vous dit quoi faire.
@@ -115,7 +115,10 @@ python -I make_game.py --game "D:\chemin\vers\le\paquet" --wav  # décode aussi 
 python -I make_game.py --wave64-emulate off            # auto (par défaut), on ou off
 ```
 
-Les étapes s'exécutent dans cet ordre : `check` → `shaders` → `assets` → `runtime` → `pipelines`. L'étape
+`check` passe toujours en premier ; ensuite, `shaders`, `assets` et `runtime` tournent en même temps quand ils sont
+demandés (ils ne dépendent pas les uns des autres). `pipelines` démarre dès que les shaders traduits sont prêts et,
+si l'exécution comprend `runtime`, une fois que cette étape a recompilé `vk_pipeline_check` : elle peut donc tourner
+pendant la fin d'`assets`. L'étape
 `pipelines` crée chaque shader traduit avec le pilote de votre GPU, vérifie qu'il compile, signale ceux qu'elle doit
 ignorer et enregistre un cache de pipelines dans `pipeline_cache.bin` (dans `--out`) ; le runtime ne charge pas
 encore ce cache.
@@ -164,16 +167,4 @@ encore ce cache.
 
 ## Contribuer et lancer les tests GPU
 
-1. Consultez les pull requests ouvertes et l'[issue de coordination][coord] pour ne pas refaire un travail en cours.
-   Réservez la tâche avec `claiming: <ID>`, ou avec une description d'une ligne s'il n'y a pas encore d'identifiant.
-2. Lancez les tests concernés, avec des entrées synthétiques. Par exemple, `python -I tests/test_manifest_verifier.py`
-   depuis la racine du dépôt.
-3. Dans la pull request, indiquez l'identifiant de la tâche, ce que vous avez testé, et le GPU et le pilote si vous
-   avez lancé des tests GPU. Précisez si vous avez été assisté par une IA. Les règles sont dans
-   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
-
-Le [guide des tests GPU](../../testing.md) explique comment lancer les tests sans aucun fichier du jeu. Publiez vos
-résultats dans l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), un commentaire par GPU et par
-pilote.
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).

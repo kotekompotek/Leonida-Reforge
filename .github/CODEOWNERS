@@ -1,0 +1,24 @@
+# Default project reviewer. The last matching line takes precedence.
+* @JokerDreamerCoder
+
+# GitHub policy, CI and release workflows.
+/.github/ @LeonidaReforge/core-team
+/.github/CODEOWNERS @LeonidaReforge/core-team
+/.github/workflows/ @LeonidaReforge/core-team
+/GOVERNANCE.md @LeonidaReforge/core-team
+/SECURITY.md @LeonidaReforge/core-team
+/CODE_OF_CONDUCT.md @LeonidaReforge/core-team
+
+# Build, installation and dependency supply chain.
+/.gitmodules @LeonidaReforge/core-team
+/Build.bat @LeonidaReforge/core-team
+/make_game.py @LeonidaReforge/core-team
+/scripts/ @LeonidaReforge/core-team
+/runtime/test/shaders/build.py @LeonidaReforge/core-team
+/tools/conformance/native/scripts/ @LeonidaReforge/core-team
+/third_party/ @LeonidaReforge/core-team
+**/CMakeLists.txt @LeonidaReforge/core-team
+**/Cargo.toml @LeonidaReforge/core-team
+**/Cargo.lock @LeonidaReforge/core-team
+**/*.csproj @LeonidaReforge/core-team
+**/requirements*.txt @LeonidaReforge/core-team

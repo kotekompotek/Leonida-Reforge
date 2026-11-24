@@ -65,7 +65,7 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 2. Scarica il progetto **con il suo sottomodulo**:
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
 
    Il «Download ZIP» di GitHub non include `third_party/rpf9-explorer`. La build lo scarica da sola se `git` è
@@ -137,20 +137,7 @@ avvio non devono essere compilati. La traduzione degli shader è il passaggio pi
 
 ## Come contribuire ed eseguire i test GPU
 
-1. Controlla le pull request aperte e l'[issue di coordinamento][coord] per evitare lavoro duplicato. Riserva
-   l'attività scrivendo `claiming: <ID>` (oppure una descrizione di una riga se non esiste ancora un ID) prima
-   di aprire la pull request.
-2. Esegui i test pertinenti con input sintetici. Per esempio, per il verificatore dei manifest:
-   `python -I tests/test_manifest_verifier.py` dalla radice del repository. La suite del traduttore si esegue
-   con `python -m unittest discover -s tests/semantic -v`.
-3. Nella pull request indica l'ID dell'attività, cosa hai provato e, se hai eseguito test GPU, quale GPU e
-   quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se hai usato un assistente
-   IA, dichiaralo nella pull request, come richiesto da [`AGENTS.md`](../../../AGENTS.md).
-
 **Mai** allegare a issue o pull request file del gioco, asset estratti o shader generati: condividi solo
 risultati (conteggi, esito dei test, classi di errore).
 
-La [guida ai test GPU](../../testing.md) spiega come eseguirli senza i file del gioco. I risultati dei test GPU
-vanno pubblicati nell'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
-
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+See the current [contribution guide](../../../CONTRIBUTING.md) and [GPU testing guide](../../testing.md).
