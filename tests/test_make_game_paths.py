@@ -39,13 +39,15 @@ class BuildDestinationTest(unittest.TestCase):
             os.symlink(target, path, target_is_directory=True)
             self.addCleanup(os.unlink, path)
 
-    def run_build(self, game, out, work, rejected):
+    def run_build(self, game, out, work, rejected, manifest=None):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
                 "--stages", "runtime", "--no-tui"]
+        if manifest is None:
+            manifest = {"expected_exe": "game.exe", "files": []}
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
-            stack.enter_context(patch("make_game.check", return_value={}))
+            stack.enter_context(patch("make_game.check", return_value=manifest))
             stack.enter_context(patch("make_game.log"))
             preflight = stack.enter_context(patch("make_game.preflight"))
             build_runtime = stack.enter_context(patch("make_game.runtime"))
@@ -94,40 +96,49 @@ class BuildDestinationTest(unittest.TestCase):
         drive = os.path.splitdrive(self.root)[0] + "\\"
         content_dir = os.path.join(drive, "Content")
         independent_dir = os.path.join(drive, "Leonida_Build")
-        with patch("os.listdir", return_value=["Content"]):
-            # Allowed: destination is an independent folder on the drive root
-            self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
-            # Rejected: destination is inside the game dump's own top-level entry
-            self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
-            # Rejected: destination is the drive root itself
-            self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
+        manifest = {"expected_exe": "Content/game.exe", "files": ["Content/common.rpf"]}
+        # Allowed: destination is an independent folder on the drive root (even if it already exists on disk)
+        self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"),
+                       rejected=False, manifest=manifest)
+        # Rejected: destination is inside the game dump's own top-level manifest entry
+        self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"),
+                       rejected=True, manifest=manifest)
+        # Rejected: destination is the drive root itself
+        self.run_build(drive, drive, os.path.join(self.root, "work"),
+                       rejected=True, manifest=manifest)
 
     def test_drive_root_checks_entries_on_each_volume(self):
         if os.name != "nt":
             self.skipTest("Windows drive root check")
         root = os.path.splitdrive(self.root)[0] + "\\"
         other_root = "Z:\\" if root.upper() != "Z:\\" else "Y:\\"
-        junction = os.path.join(root, "MountedContent")
         mounted_content = os.path.join(other_root, "Package")
 
-        def realpath(path):
-            if os.path.normcase(path) == os.path.normcase(junction):
-                return mounted_content
-            return os.path.normpath(path)
-
-        # A junction target on a different volume must not end the search before the matching entry.
-        for entries, protected in (
-            (["MountedContent", "Content"], os.path.join(root, "Content")),
-            (["Content", "MountedContent"], mounted_content),
+        # make_game iterates sorted top-level manifest entries: test both a cross-volume junction
+        # sorting before "Content" ("AMountedContent") and one sorting after it ("MountedContent").
+        for junction_name, protected in (
+            ("AMountedContent", os.path.join(root, "Content")),
+            ("MountedContent", mounted_content),
         ):
-            with patch("os.listdir", return_value=entries), patch("os.path.realpath", side_effect=realpath):
+            junction = os.path.join(root, junction_name)
+            manifest = {
+                "expected_exe": "Content/game.exe",
+                "files": [f"{junction_name}/data.rpf"],
+            }
+
+            def realpath(path, target_junction=junction):
+                if os.path.normcase(path) == os.path.normcase(target_junction):
+                    return mounted_content
+                return os.path.normpath(path)
+
+            with patch("os.path.realpath", side_effect=realpath):
                 for option in ("out", "work"):
-                    with self.subTest(protected=protected, option=option):
+                    with self.subTest(junction=junction_name, protected=protected, option=option):
                         destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
                         destinations[option] = os.path.join(protected, "build")
-                        self.run_build(root, **destinations, rejected=True)
+                        self.run_build(root, **destinations, rejected=True, manifest=manifest)
                 self.run_build(root, os.path.join(other_root, "Build"),
-                               os.path.join(other_root, "Scratch"), rejected=False)
+                               os.path.join(other_root, "Scratch"), rejected=False, manifest=manifest)
 
 
 if __name__ == "__main__":

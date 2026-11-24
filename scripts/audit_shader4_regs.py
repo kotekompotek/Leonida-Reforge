@@ -198,12 +198,15 @@ def rbw_registers(insns):
             or (is_gf_atomic and "glc" not in mods)
             or (is_bi_atomic and "glc" not in mods)
             or (op.startswith("ds_") and "_rtn" not in op and not op.startswith(DS_HAS_DST))
+            # A buffer load with lds transfers straight to LDS: args[0] is vaddr, not a written VGPR.
+            or (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods)
         )
         reads_imm_dst = op in SGPR_RMW
         # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];
         # global/flat atomics with glc write vdst at args[0] and read vaddr/vdata/saddr from args[1:]).
         dst_also_read = (
-            reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
+            reads_imm_dst or "fmac" in op or "mac_" in op or "dot2c_" in op or "dot4c_" in op or "dot8c_" in op
+            or op == "v_writelane_b32"
             or op == "v_swap_b32" or (not is_gf_atomic and "_atomic_" in op)
             or op in VOP_DOT_ACCUM
         )

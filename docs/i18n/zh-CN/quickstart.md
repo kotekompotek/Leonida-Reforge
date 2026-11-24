@@ -30,7 +30,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
   （wave64 着色器以模拟方式运行），以及 MoltenVK 的浮点处理；详见 [`docs/testing.md`](../../testing.md)。
 - **AMD RDNA1（RX 5000）**：受支持的目标，接近主机的 RDNA2；它的 64 宽子组可原生运行 wave64 着色器。
 
-所有平台的 GPU 结果都汇总在 [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166)。
+See the [GPU testing guide](../../testing.md) for current reporting instructions.
 
 ## 前置条件
 
@@ -47,7 +47,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
     构建脚本大约需要 20-40 分钟。
   - 如果你用 [conda](https://docs.conda.io/)，更快的办法是 `conda install -c conda-forge llvm-tools`（它的 Windows
     版本包含 AMDGPU target），然后把 `LLVM_MC` 设为安装好的 `llvm-mc.exe` 的完整路径（激活环境后用
-    `where llvm-mc` 查看）。
+    `where.exe llvm-mc` 查看；PowerShell 里单独的 `where` 是 `Where-Object`）。
   - Linux 上 `PATH` 里有 `llvm-mc` 即可。
 - **Visual Studio 2022**，勾选“使用 C++ 的桌面开发”和 **Windows SDK `10.0.26100` 或更新**
   （`runtime` 阶段需要，它使用 root signature 1.2）。
@@ -61,7 +61,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 2. **带子模块**克隆仓库：
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/LeonidaReforge/Leonida.git
    ```
 
    用 GitHub 的 “Download ZIP” 下载会缺少 `third_party/rpf9-explorer`：装了 `git` 时构建会自动获取，否则会告诉你该怎么做。

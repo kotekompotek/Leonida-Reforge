@@ -51,6 +51,11 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 same pipeline. Use it before driver compilation to locate missing varyings, overlapping components, type
 mismatches and per-primitive mesh declarations. It reads local modules and needs only Python.
 
+The declarations come from `tools/spirv_interface.py`, a standard-library reader of one module's interface
+(the normalized `Location`/`Component` model, one array level and literal specialization defaults) with its
+tests in `tests/test_spirv_interface.py`. It reflects declarations only, not instructions, device features or
+resource bindings, so it does not replace `spirv-val`.
+
 ```powershell
 python -I tools/shader_link_check.py check --vs <vertex.spv> --ps <pixel.spv>
 python -I tools/shader_link_check.py check --vs <vertex.spv> --gs <geometry.spv> --ps <pixel.spv>

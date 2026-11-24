@@ -72,6 +72,12 @@ Names the translator matches that are not in the RDNA2 XML (10), each checked wi
 | `s_delay_alu` | other GPU only (RDNA3) | deliberate, in `NOOPS` |
 | `v_mac_f32`, `v_mac_legacy_f32`, `v_mad_f32`, `v_mad_legacy_f32`, `v_madak_f32`, `v_madmk_f32`, `s_get_waveid_in_workgroup` | valid | real gfx1013 instructions that AMD's XML omits |
 
+`tools/rdna2_decode.py` decodes raw words without LLVM from the opcode and operand tables in
+`tools/rdna2_isa_tables.py`, which are derived from the same `amdgpu_isa_rdna2.xml`. The gfx1013 entries above
+that the XML omits (`v_mac_f32`, `v_mad_f32`, `v_madak_f32`, `v_madmk_f32`, `s_get_waveid_in_workgroup`) are in
+that table, and `v_mad_legacy_f32` is the name the decoder gives VOP3 opcode 0x140 on a gfx101* target. A name
+added there belongs in the table above as well.
+
 None is a typo that breaks translation, so there is nothing to fix in the translator. No name ends in a suffix
 `base_op()` strips (`_e32`, `_e64`, `_sdwa`, `_dpp`), and every `startswith` prefix matches at least one RDNA2
 instruction.

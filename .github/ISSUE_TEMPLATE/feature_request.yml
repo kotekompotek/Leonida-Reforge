@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose an improvement to Leonida.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and pull requests first. Do not share game files, extracted artifacts, or credentials.
+        For a security vulnerability, follow the repository's security policy instead of filing a public issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the current limitation and who it affects.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the desired behavior, any alternatives, and what should stay out of scope.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Suggest a way to verify the change using synthetic or redistributable inputs.

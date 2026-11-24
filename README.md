@@ -1,16 +1,19 @@
-<h1 align="center">
-  <br>
-  <a>
-  <img src="assets/logo.png" alt="Leonida" width="200">
-</a>
+# Leonida
 
-  <br>
-  <b>Leonida</b>
-  <br>
-</h1>
+## Independent continuation
 
-<h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
-</h4>
+[LeonidaReforge](https://github.com/LeonidaReforge) owns this repository, and
+[@JokerDreamerCoder](https://github.com/JokerDreamerCoder) is its maintainer. This is an independent continuation
+of the original open-source Leonida project. Thank you to its original developers, researchers, maintainers,
+and contributors. The recovered Git history retains their authorship, and existing license and copyright
+notices still apply.
+
+LeonidaReforge is not affiliated with, endorsed by, or acting on behalf of Rockstar Games, Take-Two Interactive,
+Microsoft, or the project's former administration. Historical links and measurements are credited to the
+original project; they are not verification by LeonidaReforge.
+
+Leonida is an experimental build-it-yourself project aiming to run the Xbox Series version of Grand Theft Auto VI
+on Windows from a user's own copy. It does not provide a playable release.
 
 <p align="center">
   <a href="docs/i18n/README.md">Other languages</a> |
@@ -20,7 +23,7 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="https://discord.gg/rexed">Discord</a>
+  <a href="GOVERNANCE.md">Governance</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -34,13 +37,11 @@ happens **on your PC, from your own copy of the game**.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
 
-Discord: https://discord.gg/rexed
-<br>
-
 ## Project status
 
-**Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
-work on booting can start as soon as one is available to a developer.
+The table is an inherited snapshot of the original project's work, not a current compatibility report.
+LeonidaReforge has not independently reproduced these historical results. The continuation does not claim a
+verified retail boot or working gameplay.
 
 | What | Status |
 |---|---|
@@ -66,16 +67,16 @@ and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder 
 
 ## Platforms
 
-Nothing is playable on any platform yet (see *Project status*). What runs where today:
+The following platform notes describe historical test coverage, not a current playability claim:
 
-| Platform | Today |
+| Platform | Historical coverage |
 |---|---|
 | Windows | Everything: `make_game.py`, the tools, and the runtime (`gta6rt` and the D3D12 → Vulkan layer) with its tests. |
 | Linux | The translator, the asset tools and the Vulkan GPU test tools build and run natively (tested on RADV and NVIDIA). The runtime is Windows code: it cross-compiles with clang-cl and xwin, and its tests run under Wine or Proton (*The Windows runtime on Linux, under Wine or Proton* below). The game is meant to run the same way, under Wine or Proton with the D3D12 layer on native Vulkan (#217). |
 | macOS (Apple Silicon) | The Python tools and the Vulkan test tools run natively, on MoltenVK (Homebrew) or KosmicKrisp. The runtime is Windows code and runs as on Linux, under Wine: CrossOver, arm64 with FEX or x86-64 under Rosetta (#1706, #1707, #1924; #3119 fixes the last loader tests there). Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
 | AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
 
-GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
+See [docs/testing.md](docs/testing.md) to run and report new GPU tests. The original issue #166 is a historical reference.
 
 ## How to build
 
@@ -84,7 +85,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/LeonidaReforge/Leonida.git`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
@@ -117,11 +118,6 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
-
-**Is this PC strong enough?** `python -I tools/pc_checker.py --cli` detects the CPU, GPU and RAM and compares them
-with the reference profiles before a long build: `--profile 1`, the default, is an Xbox Series X PC equivalent and
-`--profile 2` a 1080p Low community estimate. `python -I tools/pc_checker.py --check --json` prints the same verdict
-as JSON and returns it as an exit code (0 good, 1 weak, 2 unknown).
 
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
 needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and `--wav` adds several times the
@@ -165,7 +161,8 @@ them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserv
 skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
 (read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
 `--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
-`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
+`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`;
+on by itself on Intel's Windows Vulkan driver, whose native mesh draws crash, BUILD-2202, unless `--native-mesh`).
 Each is documented in [docs/design.md](docs/design.md).
 
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
@@ -243,7 +240,7 @@ in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEON
 | Piece | What it does | Where |
 |---|---|---|
 | Version check | Every package file's name, size and SHA-256 for each supported version | `game/`, `make_game.py` |
-| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py`, `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
+| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py` ([optional Rust scanner](tools/shader_carve_native/README.md)), `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
 | Asset export | Finds validated resources inside RPF9 archives and the loose `.ttpf` texture pools | `tools/rpf9dump` (on rpf9-explorer's Core) |
 | Runtime | Maps the PE image, resolves imports to shims (GDK, XMem, `d3d12_xs`) | `runtime/` |
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
@@ -263,12 +260,13 @@ The biggest open pieces:
 - **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
   [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
   unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
-- **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
-  remaining method surface, and nothing has been checked against the real executable yet ([plan and status](docs/d3d12_vulkan.md)).
+- **Xbox D3D12 → Vulkan**: see the [technical plan and historical status](docs/d3d12_vulkan.md).
+  Check the new repository's issues and pull requests for current work before starting.
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
-pull requests.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
+[repository issues](https://github.com/LeonidaReforge/Leonida/issues). Never attach game files, extracted assets
+or generated shaders to issues or pull requests.
 
 ## Credits
 
@@ -279,7 +277,8 @@ pull requests.
 - [libHttpClient](https://github.com/microsoft/libHttpClient) (MIT) by Microsoft: the XTaskQueue/XAsync implementation
   in `third_party/xtaskqueue`, used by the offline `xgameruntime` shim.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
-- Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
+- Historical logo credit: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on
+  SteamGridDB. The inherited artwork is not used in the current tree; see the [redistribution review](docs/redistribution-review.md).
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or

@@ -52,6 +52,7 @@ Both formats scale a u8 value into the header's Z box:
 <carve_dir> is an rpf9_carve.py output directory (index.json plus <offset>.bin
 files). Only header fields, dimensions, row counts and value ranges are
 printed or written; the height bytes are not. Standard library only.
+Usage: `python -I tools/gamedata_maps.py --help` lists the options.
 """
 from __future__ import annotations
 

@@ -15,15 +15,19 @@ needed or bundled.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
+import errno
 import json
 import os
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -663,7 +667,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.json_path:
-        if os.path.isdir(args.json_path):
+        # A trailing separator marks a directory-style destination; realpath would strip it and publish
+        # over a same-named file, which open(..., "w") never did.
+        separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
+        if os.path.isdir(args.json_path) or args.json_path.endswith(separators):
             print(f"error: --json {args.json_path} is a directory", file=sys.stderr)
             return 2
         if same_report_path(args.json_path, args.input):
@@ -685,12 +692,32 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError) as exc:
             print(f"error: cannot write {args.json_path}: {exc}", file=sys.stderr)
             return 2
+        # Publish at the symlink's target, as open(..., "w") did before the report was staged, without
+        # replacing the link. os.replace unlinks only at the destination name, so another hard link to
+        # the previous report keeps its bytes (the report-writer rule story_index.write_output documents).
+        staged = None
         try:
-            with open(args.json_path, "w", encoding="utf-8", newline="\n") as handle:
+            destination = os.path.realpath(args.json_path)
+            if os.path.islink(destination):
+                # realpath leaves an unresolved link in place for a cycle (or past the depth limit); replacing it
+                # would break the promise above. open(..., "w") failed with ELOOP there.
+                raise OSError(errno.ELOOP, "Too many levels of symbolic links", args.json_path)
+            directory = os.path.dirname(os.path.abspath(destination))
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=directory,
+                                             prefix=".glb_inspect-", delete=False) as handle:
+                staged = handle.name
                 handle.write(text)
+            os.chmod(staged, published_mode(destination))
+            os.replace(staged, destination)
+            staged = None
         except OSError as exc:
             print(f"error: cannot write {args.json_path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
             return 2
+        finally:
+            if staged is not None:
+                with suppress(OSError):
+                    os.chmod(staged, 0o600)
+                    os.unlink(staged)
     print(format_report(report))
     if args.json_path:
         print(f"wrote: {args.json_path}")

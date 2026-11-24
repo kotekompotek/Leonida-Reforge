@@ -30,7 +30,7 @@ Each cell is the median of 12 process medians, each from 25 timed dispatches aft
 From a Leonida checkout with Vulkan headers, CMake, Ninja and MoltenVK installed:
 
 ```sh
-git fetch https://github.com/ItsNotRexed/Leonida.git f165a13ff8bc12d2516e399bb87f923553fa107e
+git fetch https://github.com/LeonidaReforge/Leonida.git f165a13ff8bc12d2516e399bb87f923553fa107e
 git worktree add --detach ../leonida-639 FETCH_HEAD
 cd ../leonida-639
 cmake -S runtime -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo

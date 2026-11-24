@@ -11,7 +11,7 @@ on:
   # it. tests/test_runtime_paths.py recomputes the tools/ part and fails when an entry is missing; keep the two
   # lists identical.
   push:
-    branches: [main]
+    branches: [main, integration/ci-recovery]
     paths:
       - "runtime/**"
       - "third_party/**"
@@ -35,6 +35,7 @@ on:
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/rdna2spirv.py"
+      - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
       - "tools/shader_disasm.py"
@@ -73,6 +74,7 @@ on:
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/rdna2spirv.py"
+      - "tools/replace_retry.py"
       - "tools/report_paths.py"
       - "tools/shader_carve.py"
       - "tools/shader_disasm.py"
@@ -498,7 +500,9 @@ jobs:
   # hosted runner is a VM whose Metal device is "Apple Paravirtual device" (MTLGPUFamilyMac2, not Apple7), so
   # Mesa's KosmicKrisp finds no device there; MoltenVK runs, with 32-wide subgroups. macos-26, not macos-15: Xcode
   # 16's libc++ has no floating-point std::from_chars (vk_pipeline_check.cpp).
+  # During recovery, validate MoltenVK on demand and on eligible pushes to main.
   macos:
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     runs-on: macos-26
     timeout-minutes: 20
     env:

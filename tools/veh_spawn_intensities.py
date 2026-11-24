@@ -15,6 +15,7 @@ The CLI prints one aggregate JSON object and never prints entry keys, names or p
 those are game values. The Python API (`records`) returns entries that contain the table's own
 text, so call sites must not write them anywhere public. A bad input gives one ERROR line and
 exit 2. Standard library only; no game data is required beyond the local rebuilt file.
+Usage: `python -I tools/veh_spawn_intensities.py --help` lists the options.
 """
 from __future__ import annotations
 

@@ -22,7 +22,8 @@ class FirstLookPathTests(unittest.TestCase):
             for folder in ("scripts", "tools", "runtime/build/Release"):
                 (repo / folder).mkdir(parents=True)
             for relative in ("scripts/first_look.ps1", "tools/pe_inspect.py", "tools/gdk_runtime_calls.py",
-                             "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py"):
+                             "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py",
+                             "tools/report_paths.py"):
                 shutil.copyfile(source / relative, repo / relative)
             game = Path(tmp, "package [1]")
             game.mkdir()
@@ -53,8 +54,11 @@ public class Loader { public static void Main(string[] args) { System.Console.Wr
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             out = repo / "reports/exe" / image.stem
             self.assertIn(hashlib.sha256(image.read_bytes()).hexdigest(), (out / "hash.txt").read_text("utf-16"))
-            self.assertEqual((out / "dryrun.txt").read_text("utf-16").splitlines(),
-                             ["--dry-run", str(image), "--game-dir", str(game)])
+            dryrun = (out / "dryrun.txt").read_text("utf-16").splitlines()
+            self.assertEqual(len(dryrun), 4, dryrun)
+            self.assertEqual((dryrun[0], dryrun[2]), ("--dry-run", "--game-dir"))
+            self.assertEqual(Path(dryrun[1]).resolve(), image.resolve())
+            self.assertEqual(Path(dryrun[3]).resolve(), game.resolve())
             imports = json.loads((out / (image.name + ".json")).read_text("utf-8"))["imports"]
             self.assertTrue(any(d["dll"].lower() == "xmem.dll" and d["where"] == "bundled" for d in imports))
             self.assertIn("fake_lib.dll", (out / "shim-todo.txt").read_text())

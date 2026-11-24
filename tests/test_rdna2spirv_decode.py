@@ -230,14 +230,8 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.gen.decode_format(words, 7, fixed=False)
         self.assertEqual(len(self.gen.tbuffer_norm_fns), fns_count)
 
-    def test_decode_any_format_selection(self):
-        words = ["%w0", "%w1", "%w2", "%w3"]
-        initial_lines = len(self.gen.body)
-        comps = self.gen.decode_any_format("%run_fmt", words)
-        self.assertEqual(len(comps), 4)
-        emitted = "\n".join(self.gen.body[initial_lines:])
-        self.assertIn("OpIEqual %bool %run_fmt", emitted)
-        self.assertIn("OpSelect %uint", emitted)
+    # decode_any_format (one OpIEqual/OpSelect per format code) went away with SHADER-849's table decode;
+    # tests/semantic/test_format_decode_table.py checks that path, and format_decode_call is checked below.
 
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]

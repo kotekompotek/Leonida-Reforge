@@ -309,6 +309,8 @@ class _Types:
             return tuple(self.zero(k[1]) for _ in range(k[2]))
         if k[0] == "arr":
             return [self.zero(k[1]) for _ in range(k[2])]
+        if k[0] == "struct":
+            return [self.zero(m) for m in k[1]]        # a list, so OpAccessChain can select a member
         raise UnsupportedConstruct(f"zero value of type {name} ({k[0]})")
 
     def size(self, name):
@@ -359,7 +361,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     (missing words read as zero). `memory` is a mutable {byte_address: word} mapping used for
     PhysicalStorageBuffer loads and stores.
 
-    Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
+    Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns, a
+    bool as 0 or 1, and an aggregate (a mesh shader's arrayed outputs) as its scalars in order. A mesh shader's
+    result also has "OpSetMeshOutputsEXT": (vertex count, primitive count) once that instruction has run.
     A module with a subgroup operation is rejected here; see run_workgroup.
     """
     gen = _invocation(text, inputs, push_constants, memory)
@@ -539,6 +543,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     first_fn = None
     body = []
     outputs = []
+    mesh_counts = []            # the OpSetMeshOutputsEXT operands, once it has run
 
     def val(x):
         if x in values:
@@ -879,6 +884,21 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             else:
                 p[0][p[1]] = new & MASK
             values[res] = old
+        elif op == "OpAtomicStore":
+            # <pointer> <scope> <semantics> <value>, no result: with invocations run one at a time, a plain store of
+            # the 32-bit word to the same pointers the atomics above take.
+            p, v = pointers[a[0]], val(a[3])
+            if p[0] == "pc":
+                raise UnsupportedConstruct(f"{op} on a PushConstant")
+            if isinstance(v, bool) or not isinstance(v, int) or v > MASK:
+                raise UnsupportedConstruct(f"{op} of a value that is not a 32-bit integer")
+            if p[0] == "psb":
+                memory[psb_word(p[1])] = v
+            else:
+                old = deref(p)
+                if isinstance(old, bool) or not isinstance(old, int):
+                    raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
+                p[0][p[1]] = v
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
                 raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
@@ -961,6 +981,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op == "OpBitReverse":
             bits = types.bits(a[0])
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
+        elif op == "OpFConvert":
+            # binary64 <-> binary32. Narrowing rounds to nearest even (struct's '<f' in f32()); widening is exact.
+            x = val(a[1])
+            src = types.t.get(id_type.get(a[1]))
+            if not isinstance(x, float) or {src, types.t[a[0]]} != {("float", 32), ("float", 64)}:
+                raise UnsupportedConstruct("OpFConvert other than binary32 <-> binary64")
+            if math.isnan(x):
+                raise UnsupportedConstruct("OpFConvert of a NaN (payload and quieting not modelled)")
+            values[res] = f32(x) if types.t[a[0]] == ("float", 32) else float(x)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
             # The width comes from the operand's type, as in sval(): a 64-bit value below 2**32 passes the value
@@ -1010,6 +1039,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
             # refuses it, as it does a subgroup operation: a barrier belongs to a workgroup.
             yield (op, pc - 1, None, None)
+        elif op == "OpSetMeshOutputsEXT":
+            # <vertex count> <primitive count> (SPV_EXT_mesh_shader). The invocation's result reports them under
+            # this opcode's name. The extension allows one call per invocation.
+            if mesh_counts:
+                raise InvalidModule(f"{line!r}: OpSetMeshOutputsEXT runs a second time")
+            mesh_counts[:] = [val(a[0]), val(a[1])]
         elif op == "OpGroupNonUniformBroadcastFirst":
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformBroadcastFirst other than a Subgroup-scope integer")
@@ -1062,9 +1097,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
             if types.t[a[0]] == ("float", 64):
-                if op != "OpFMul":
+                if op == "OpFDiv":
                     raise UnsupportedConstruct(f"{op} on binary64")
-                values[res] = x * y
+                if op != "OpFMul" and (math.isnan(x) or math.isnan(y)):
+                    raise UnsupportedConstruct(f"{op} on a binary64 NaN (payload not modelled)")
+                # Python's float is binary64 and rounds each operation to nearest even, as SPIR-V's default does.
+                values[res] = x * y if op == "OpFMul" else x + y if op == "OpFAdd" else x - y
                 continue
 
             def _fdiv(p, q):
@@ -1093,8 +1131,15 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            negated = -val(a[1])
-            values[res] = negated if types.t[a[0]] == ("float", 64) else f32(negated)
+            # IEEE 754 negate only flips the sign bit: it keeps a NaN's payload and does not quiet a signalling NaN.
+            # A binary32 operand is negated on its bits, because the float round trip in f32() sets the quiet bit
+            # of a signalling NaN before CPython 3.14 (issue #509), as on CI's 3.12: -v1 on 0x7F800001 must give
+            # 0xFF800001, not 0xFFC00001 (AllNaNSrc0PayloadTests).
+            x = val(a[1])
+            if types.t[a[0]] == ("float", 64):
+                values[res] = -x
+            else:
+                values[res] = bits_f32(f32_bits(x) ^ 0x80000000)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
@@ -1286,8 +1331,17 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     if killed:
         return {}
     result = {}
+
+    def flat(v):
+        """The scalars of an output in order: vector components, array elements and struct members."""
+        if isinstance(v, (list, tuple)):
+            for x in v:
+                yield from flat(x)
+        else:
+            yield v
+
     for name in outputs:
-        v = var_box[name][0]
-        flat = v if isinstance(v, tuple) else (v,)
-        result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat)
+        result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat(var_box[name][0]))
+    if mesh_counts:
+        result["OpSetMeshOutputsEXT"] = tuple(mesh_counts)
     return result

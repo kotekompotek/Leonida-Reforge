@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -69,8 +70,8 @@ class FuzzerWorkIsolation(unittest.TestCase):
                     self.assertTrue((run / (program.name + ".asm")).is_file())
                     self.assertTrue((run / "spirv" / "index.json").is_file())
                 self.assertNotEqual(runs[0], runs[1])
-                self.assertTrue(any(str(runs[0]) in out for out in outputs))
-                self.assertTrue(any(str(runs[1]) in out for out in outputs))
+                self.assertTrue(any(str(runs[0].resolve()) in out for out in outputs))
+                self.assertTrue(any(str(runs[1].resolve()) in out for out in outputs))
 
     def test_failed_translation_reports_retained_output_and_creates_parent(self):
         for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
@@ -85,7 +86,7 @@ class FuzzerWorkIsolation(unittest.TestCase):
                 runs = list(parent.iterdir())
                 self.assertEqual(len(runs), 1)
                 self.assertTrue(runs[0].is_dir())
-                self.assertIn(str(runs[0]), output.getvalue())
+                self.assertIn(str(runs[0].resolve()), output.getvalue())
                 self.assertIn("synthetic failure", output.getvalue())
 
     def test_existing_file_as_work_reports_one_error(self):
@@ -156,6 +157,40 @@ class FuzzerWorkIsolation(unittest.TestCase):
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(module.main(), 0)
                 self.assertFalse(parent.exists())
+
+    def test_aliased_work_directory_reports_resolved_run_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real_work"
+            real.mkdir()
+            alias = Path(tmp) / "alias_work"
+            if os.name == "nt":
+                res = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(real)],
+                                     capture_output=True, text=True)
+                if res.returncode:
+                    self.skipTest("cannot create a directory junction: " + res.stderr)
+                remove_alias = os.rmdir
+            else:
+                try:
+                    os.symlink(real, alias, target_is_directory=True)
+                except OSError as exc:
+                    self.skipTest(f"cannot create a directory symlink: {exc}")
+                remove_alias = os.unlink
+
+            try:
+                for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
+                    with self.subTest(fuzzer=module.__name__):
+                        parent = alias / module.__name__
+                        output = io.StringIO()
+                        argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(parent), *extra]
+                        with (patch.object(sys, "argv", argv),
+                              patch.object(module, "translate", side_effect=RuntimeError("synthetic failure")),
+                              contextlib.redirect_stdout(output)):
+                            self.assertEqual(module.main(), 2)
+                        runs = list(parent.iterdir())
+                        self.assertEqual(len(runs), 1)
+                        self.assertIn(str(runs[0].resolve()), output.getvalue())
+            finally:
+                remove_alias(alias)
 
 
 if __name__ == "__main__":

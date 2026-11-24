@@ -7,11 +7,16 @@ how smooth that image is. Real textures are spatially coherent, so the right lay
 Usage:
     python -I tile_probe.py <blob> [--out preview.png] [--offset N]
 """
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # main() checks the inputs first, then says numpy is missing in one line
+    np = None
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -175,6 +180,9 @@ def main():
         return 2
     if a.out:
         check_preview_path(a.out, a.blob)
+    if np is None:
+        print("ERROR: tile_probe.py needs numpy (python -m pip install numpy)", file=sys.stderr)
+        return 2
     try:
         with open(a.blob, "rb") as f:
             data = f.read()
